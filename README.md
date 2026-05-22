@@ -1,6 +1,9 @@
 # 0xtrace
 
+**[🔴 Live Interactive Demo](https://0xtrace-mu.vercel.app/)**
+
 ![0xtrace Dashboard Preview](./public/0xtrace-dashboard-preview.png)
+
 A high-performance observability and telemetry dashboard for LLM applications.
 
 0xtrace is engineered to solve a specific, expensive problem in AI engineering: **context window bloat**. It provides an asynchronous ingestion pipeline and a strict visualization layer to monitor latency, token usage, and prompt drift in production environments.
@@ -32,7 +35,7 @@ When building complex LLM agents, context windows silently expand as system prom
 ### 1. Clone the repository
 
 ```bash
-git clone [https://github.com/Sidhant0707/0xtrace.git](https://github.com/Sidhant0707/0xtrace.git)
+git clone https://github.com/Sidhant0707/0xtrace.git
 cd 0xtrace
 npm install
 2. Environment Variables

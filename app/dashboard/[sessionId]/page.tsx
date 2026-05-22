@@ -28,20 +28,20 @@ import { supabaseAdmin } from "@/lib/supabase";
 const CONTEXT_LIMIT = 128_000;
 
 /** Fraction of CONTEXT_LIMIT at which the anomaly threshold line is drawn. */
-const ANOMALY_THRESHOLD_PCT = 0.60;
+const ANOMALY_THRESHOLD_PCT = 0.6;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /** Raw row shape returned by the Supabase query. */
 interface LlmCallRaw {
-  id:                  string;
-  model:               string;
-  tokens_in:           number | null;
-  tokens_out:          number | null;
-  latency_ms:          number;
-  estimated_cost_usd:  number | null;
-  metadata:            Record<string, unknown> | null;
-  timestamp:           string;
+  id: string;
+  model: string;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  latency_ms: number;
+  estimated_cost_usd: number | null;
+  metadata: Record<string, unknown> | null;
+  timestamp: string;
   /** JSONB array of {role, content} message objects. May be null if the SDK
    *  was not configured to capture prompts, or on older trace rows. */
 }
@@ -50,60 +50,60 @@ type StepClassification = "normal" | "spike" | "error";
 
 /** One processed step in the session timeline. */
 interface StepData {
-  llm_call_id:    string;
-  step_index:     number;      // 1-based display index
-  model:          string;
-  tokens_in:      number;      // full context sent at this step
-  tokens_out:     number;
-  tokens_prev:    number;      // tokens_in of the previous step (0 for step 1)
-  tokens_delta:   number;      // tokens_in − tokens_prev
-  latency_ms:     number;
-  cost_usd:       number;
-  has_anomaly:    boolean;
-  prompt_preview: string;      // truncated last user/assistant message
+  llm_call_id: string;
+  step_index: number; // 1-based display index
+  model: string;
+  tokens_in: number; // full context sent at this step
+  tokens_out: number;
+  tokens_prev: number; // tokens_in of the previous step (0 for step 1)
+  tokens_delta: number; // tokens_in − tokens_prev
+  latency_ms: number;
+  cost_usd: number;
+  has_anomaly: boolean;
+  prompt_preview: string; // truncated last user/assistant message
   classification: StepClassification;
-  timestamp:      string;
+  timestamp: string;
 }
 
 /** Aggregated header data for the session. */
 interface SessionSummary {
-  session_id:      string;
-  model:           string;     // dominant model across all steps
-  total_steps:     number;
-  total_tokens:    number;     // sum of (tokens_in + tokens_out) across all steps
-  total_cost_usd:  number;
-  avg_latency_ms:  number;
-  has_anomaly:     boolean;
-  started_at:      string;
+  session_id: string;
+  model: string; // dominant model across all steps
+  total_steps: number;
+  total_tokens: number; // sum of (tokens_in + tokens_out) across all steps
+  total_cost_usd: number;
+  avg_latency_ms: number;
+  has_anomaly: boolean;
+  started_at: string;
 }
 
 interface PageProps {
-  params: Promise<{ sessionId: string }>;
+  params: Promise<{ SessionId: string }>;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}k`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return n.toString();
 }
 
 function relativeTime(iso: string): string {
-  const diffMs  = Date.now() - new Date(iso).getTime();
+  const diffMs = Date.now() - new Date(iso).getTime();
   const diffMin = Math.floor(diffMs / 60_000);
-  if (diffMin < 1)  return "just now";
+  if (diffMin < 1) return "just now";
   if (diffMin < 60) return `${diffMin} min ago`;
   const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24)  return `${diffHr} hr ago`;
+  if (diffHr < 24) return `${diffHr} hr ago`;
   const diffDay = Math.floor(diffHr / 24);
   return `${diffDay}d ago`;
 }
 
 function formatCost(usd: number): string {
-  if (usd === 0)     return "$0.00";
+  if (usd === 0) return "$0.00";
   if (usd < 0.0001) return `$${usd.toFixed(8).replace(/0+$/, "")}`;
-  if (usd < 0.01)   return `$${usd.toFixed(6).replace(/0+$/, "")}`;
+  if (usd < 0.01) return `$${usd.toFixed(6).replace(/0+$/, "")}`;
   return `$${usd.toFixed(4)}`;
 }
 
@@ -136,10 +136,10 @@ function extractPromptPreview(raw: unknown): string {
  *  average. The `hasAnomaly` flag (from metadata) always forces "error". */
 function classifyStep(
   tokensDelta: number,
-  avgDelta:    number,
-  hasAnomaly:  boolean,
+  avgDelta: number,
+  hasAnomaly: boolean,
 ): StepClassification {
-  if (hasAnomaly)                                          return "error";
+  if (hasAnomaly) return "error";
   if (avgDelta > 0 && tokensDelta > avgDelta * 2.5) return "error";
   if (avgDelta > 0 && tokensDelta > avgDelta * 1.5) return "spike";
   return "normal";
@@ -149,13 +149,13 @@ function classifyStep(
 
 async function getSessionData(sessionId: string): Promise<{
   summary: SessionSummary;
-  steps:   StepData[];
+  steps: StepData[];
 } | null> {
   const { data, error } = (await supabaseAdmin
     .from("llm_calls")
     .select(
       "id, model, tokens_in, tokens_out, latency_ms, " +
-      "estimated_cost_usd, metadata, timestamp",
+        "estimated_cost_usd, metadata, timestamp",
     )
     .eq("session_id", sessionId)
     .order("timestamp", { ascending: true })
@@ -179,54 +179,59 @@ async function getSessionData(sessionId: string): Promise<{
 
   // ── Build StepData[] ─────────────────────────────────────────────────────
   const steps: StepData[] = data.map((row, idx) => {
-    const tokensIn    = row.tokens_in  ?? 0;
-    const tokensOut   = row.tokens_out ?? 0;
-    const tokensPrev  = idx > 0 ? (data[idx - 1].tokens_in ?? 0) : 0;
+    const tokensIn = row.tokens_in ?? 0;
+    const tokensOut = row.tokens_out ?? 0;
+    const tokensPrev = idx > 0 ? (data[idx - 1].tokens_in ?? 0) : 0;
     const tokensDelta = tokensIn - tokensPrev;
-    const hasAnomaly  =
+    const hasAnomaly =
       row.metadata?.anomaly === true || row.metadata?.anomaly === "true";
 
     return {
-      llm_call_id:    row.id,
-      step_index:     idx + 1,
-      model:          row.model,
-      tokens_in:      tokensIn,
-      tokens_out:     tokensOut,
-      tokens_prev:    tokensPrev,
-      tokens_delta:   tokensDelta,
-      latency_ms:     row.latency_ms,
-      cost_usd:       row.estimated_cost_usd ?? 0,
-      has_anomaly:    hasAnomaly,
+      llm_call_id: row.id,
+      step_index: idx + 1,
+      model: row.model,
+      tokens_in: tokensIn,
+      tokens_out: tokensOut,
+      tokens_prev: tokensPrev,
+      tokens_delta: tokensDelta,
+      latency_ms: row.latency_ms,
+      cost_usd: row.estimated_cost_usd ?? 0,
+      has_anomaly: hasAnomaly,
       prompt_preview: extractPromptPreview(null),
       classification: classifyStep(tokensDelta, avgDelta, hasAnomaly),
-      timestamp:      row.timestamp,
+      timestamp: row.timestamp,
     };
   });
 
   // ── SessionSummary ───────────────────────────────────────────────────────
-  const totalCost    = steps.reduce((s, st) => s + st.cost_usd, 0);
-  const totalTokens  = steps.reduce((s, st) => s + st.tokens_in + st.tokens_out, 0);
-  const avgLatencyMs = steps.reduce((s, st) => s + st.latency_ms, 0) / steps.length;
-  const hasAnomaly   = steps.some((s) => s.has_anomaly);
+  const totalCost = steps.reduce((s, st) => s + st.cost_usd, 0);
+  const totalTokens = steps.reduce(
+    (s, st) => s + st.tokens_in + st.tokens_out,
+    0,
+  );
+  const avgLatencyMs =
+    steps.reduce((s, st) => s + st.latency_ms, 0) / steps.length;
+  const hasAnomaly = steps.some((s) => s.has_anomaly);
 
   // Dominant model: the model that appears on the most steps.
   const modelCounts = steps.reduce<Record<string, number>>((acc, s) => {
     acc[s.model] = (acc[s.model] ?? 0) + 1;
     return acc;
   }, {});
-  const dominantModel = Object.entries(modelCounts)
-    .sort((a, b) => b[1] - a[1])[0][0];
+  const dominantModel = Object.entries(modelCounts).sort(
+    (a, b) => b[1] - a[1],
+  )[0][0];
 
   return {
     summary: {
-      session_id:     sessionId,
-      model:          dominantModel,
-      total_steps:    steps.length,
-      total_tokens:   totalTokens,
+      session_id: sessionId,
+      model: dominantModel,
+      total_steps: steps.length,
+      total_tokens: totalTokens,
       total_cost_usd: totalCost,
       avg_latency_ms: avgLatencyMs,
-      has_anomaly:    hasAnomaly,
-      started_at:     data[0].timestamp,
+      has_anomaly: hasAnomaly,
+      started_at: data[0].timestamp,
     },
     steps,
   };
@@ -234,9 +239,12 @@ async function getSessionData(sessionId: string): Promise<{
 
 // ── generateMetadata ──────────────────────────────────────────────────────────
 
-export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
-  const { sessionId } = await params;
-  const display = sessionId.length > 16 ? `${sessionId.slice(0, 12)}…` : sessionId;
+export async function generateMetadata({
+  params,
+}: PageProps): Promise<Metadata> {
+  const { SessionId } = await params;
+  const display =
+    SessionId.length > 16 ? `${SessionId.slice(0, 12)}…` : SessionId;
   return { title: display };
 }
 
@@ -247,13 +255,13 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 
 function barFill(tokensIn: number): string {
   const ratio = tokensIn / CONTEXT_LIMIT;
-  if (ratio >= 0.70) return "#f43f5e"; // rose  — critical
-  if (ratio >= 0.40) return "#f59e0b"; // amber — warning
-  return "#10b981";                    // emerald — healthy
+  if (ratio >= 0.7) return "#f43f5e"; // rose  — critical
+  if (ratio >= 0.4) return "#f59e0b"; // amber — warning
+  return "#10b981"; // emerald — healthy
 }
 
 interface ContextGrowthChartProps {
-  steps:      StepData[];
+  steps: StepData[];
   hasAnomaly: boolean;
 }
 
@@ -263,14 +271,14 @@ function ContextGrowthChart({ steps, hasAnomaly }: ContextGrowthChartProps) {
   const yMax = Math.max(peakTokens, CONTEXT_LIMIT * 0.2);
 
   // Round yMax up to a clean multiple of CONTEXT_LIMIT / 4 for neat labels.
-  const quarter   = CONTEXT_LIMIT / 4;
+  const quarter = CONTEXT_LIMIT / 4;
   const yMaxRound = Math.ceil(yMax / quarter) * quarter;
 
   // Five evenly-spaced y labels from top to bottom.
   const yLabels = [
     yMaxRound,
     yMaxRound * 0.75,
-    yMaxRound * 0.50,
+    yMaxRound * 0.5,
     yMaxRound * 0.25,
     0,
   ];
@@ -281,7 +289,7 @@ function ContextGrowthChart({ steps, hasAnomaly }: ContextGrowthChartProps) {
 
   function labelText(val: number): string {
     if (val >= 1_000_000) return `${Math.round(val / 1_000_000)}M`;
-    if (val >= 1_000)     return `${Math.round(val / 1_000)}k`;
+    if (val >= 1_000) return `${Math.round(val / 1_000)}k`;
     return String(Math.round(val));
   }
 
@@ -301,19 +309,18 @@ function ContextGrowthChart({ steps, hasAnomaly }: ContextGrowthChartProps) {
       </p>
 
       {/* Chart grid: y-axis (44px) + plot area (1fr) */}
-      <div
-        className="mt-6"
-        style={{ display: "grid", gridTemplateColumns: "44px 1fr", gap: "12px" }}
-      >
+      <div className="mt-6 grid grid-cols-[44px_1fr] gap-3">
         {/* ── Y-axis ── */}
-        <div className="relative" style={{ height: "280px" }}>
+        <div className="relative h-[280px]">
           {yLabels.map((val, i) => (
             <span
               key={i}
-              className="absolute right-0 text-[#71717a] text-[11px] leading-none"
+              className={`absolute right-0 text-[#71717a] text-[11px] leading-none ${
+                i === yLabels.length - 1 ? "bottom-0" : "translate-y-1/2"
+              }`}
               style={
                 i === yLabels.length - 1
-                  ? { bottom: 0 }
+                  ? undefined
                   : {
                       top: `${(i / (yLabels.length - 1)) * 100}%`,
                       transform: "translateY(50%)",
@@ -326,10 +333,7 @@ function ContextGrowthChart({ steps, hasAnomaly }: ContextGrowthChartProps) {
         </div>
 
         {/* ── Plot area ── */}
-        <div
-          className="relative border-l border-b border-[#1f1f1f]"
-          style={{ height: "280px", padding: "0 14px" }}
-        >
+        <div className="relative border-l border-b border-[#1f1f1f] h-[280px] px-[14px]">
           {/* Anomaly threshold dashed line */}
           <div
             className="absolute left-0 right-0 pointer-events-none"
@@ -345,15 +349,7 @@ function ContextGrowthChart({ steps, hasAnomaly }: ContextGrowthChartProps) {
           </div>
 
           {/* Bar columns */}
-          <div
-            className="h-full"
-            style={{
-              display: "grid",
-              gridTemplateColumns: `repeat(${steps.length}, 1fr)`,
-              gap: "10px",
-              alignItems: "end",
-            }}
-          >
+          <div className="h-full flex w-full items-end gap-[10px]">
             {steps.map((step) => {
               const heightPct = Math.min(
                 100,
@@ -367,13 +363,10 @@ function ContextGrowthChart({ steps, hasAnomaly }: ContextGrowthChartProps) {
                   title={`Step ${step.step_index}: ${formatTokens(step.tokens_in)} tokens`}
                 >
                   <div
+                    className="w-full max-w-[34px] rounded-t min-h-[2px]"
                     style={{
-                      width:           "100%",
-                      maxWidth:        "34px",
-                      height:          heightPct > 0 ? `${heightPct}%` : "2px",
+                      height: heightPct > 0 ? `${heightPct}%` : "2px",
                       backgroundColor: barFill(step.tokens_in),
-                      borderRadius:    "4px 4px 0 0",
-                      minHeight:       "2px",
                     }}
                   />
                   <span className="text-[#71717a] text-[10px]">
@@ -393,18 +386,18 @@ function ContextGrowthChart({ steps, hasAnomaly }: ContextGrowthChartProps) {
 
 const BORDER_COLOR: Record<StepClassification, string> = {
   normal: "border-l-[#10b981]",
-  spike:  "border-l-[#f59e0b]",
-  error:  "border-l-[#f43f5e]",
+  spike: "border-l-[#f59e0b]",
+  error: "border-l-[#f43f5e]",
 };
 
 const DELTA_COLOR: Record<StepClassification, string> = {
   normal: "text-[#10b981]",
-  spike:  "text-[#f59e0b]",
-  error:  "text-[#f43f5e]",
+  spike: "text-[#f59e0b]",
+  error: "text-[#f43f5e]",
 };
 
 interface StepCardProps {
-  step:      StepData;
+  step: StepData;
   sessionId: string;
 }
 
@@ -442,14 +435,13 @@ function StepCard({ step, sessionId }: StepCardProps) {
       <div className="flex items-center justify-between gap-4 mt-2.5">
         <div className="flex items-center gap-3 text-[12px] flex-wrap">
           <span className="text-[#a1a1aa]">
-            {formatTokens(step.tokens_prev)} → {formatTokens(step.tokens_in)} tokens
+            {formatTokens(step.tokens_prev)} → {formatTokens(step.tokens_in)}{" "}
+            tokens
           </span>
           <span className={DELTA_COLOR[step.classification]}>
             +{formatTokens(step.tokens_delta)} Δ
           </span>
-          <span className="text-[#10b981]">
-            {formatCost(step.cost_usd)}
-          </span>
+          <span className="text-[#10b981]">{formatCost(step.cost_usd)}</span>
         </div>
 
         <Link
@@ -480,16 +472,16 @@ function StepCard({ step, sessionId }: StepCardProps) {
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default async function SessionDetailPage({ params }: PageProps) {
-  const { sessionId } = await params;
+  const { SessionId } = await params;
 
-  const result = await getSessionData(sessionId);
+  const result = await getSessionData(SessionId);
   if (!result) notFound();
 
   const { summary, steps } = result;
 
   // Display-safe truncated ID for the breadcrumb.
   const truncatedId =
-    sessionId.length > 20 ? `${sessionId.slice(0, 16)}…` : sessionId;
+    SessionId.length > 20 ? `${SessionId.slice(0, 16)}…` : SessionId;
 
   return (
     <div>
@@ -514,7 +506,7 @@ export default async function SessionDetailPage({ params }: PageProps) {
       <div className="bg-[#111] border border-[#1f1f1f] rounded-lg px-6 py-5 flex items-center justify-between gap-6 mb-6 flex-wrap">
         <div className="min-w-0">
           <div className="font-mono text-white text-[16px] font-medium break-all">
-            {sessionId}
+            {SessionId}
           </div>
           <div className="mt-1.5 text-[#71717a] text-[13px]">
             {summary.total_steps} step{summary.total_steps !== 1 ? "s" : ""} ·{" "}
@@ -558,11 +550,7 @@ export default async function SessionDetailPage({ params }: PageProps) {
       {/* ── Step timeline ── */}
       <div className="flex flex-col gap-3">
         {steps.map((step) => (
-          <StepCard
-            key={step.llm_call_id}
-            step={step}
-            sessionId={sessionId}
-          />
+          <StepCard key={step.llm_call_id} step={step} sessionId={SessionId} />
         ))}
       </div>
     </div>

@@ -38,22 +38,34 @@ When building complex LLM agents, context windows silently expand as system prom
 git clone https://github.com/Sidhant0707/0xtrace.git
 cd 0xtrace
 npm install
-2. Environment Variables
+```
+
+### 2. Environment Variables
+
+```bash
 Create a .env.local file in the root directory.
 NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
 SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_key
 UPSTASH_REDIS_REST_URL=your_redis_url
 UPSTASH_REDIS_REST_TOKEN=your_redis_token
-3. Initialize the Database
-Run the provided SQL migrations in your Supabase SQL Editor to generate the llm_calls and prompt_snapshots tables.
+```
 
-4. Start the Application
+### 3. Initialize the Database
+
+```bash
+Run the provided SQL migrations in your Supabase SQL Editor to generate the llm_calls and prompt_snapshots tables.
+```
+
+### 4. Start the Application
+
+```bash
 npm run dev
+```
+
 Contact & Author
 Sidhant Kumar
 
 Email: buildwithsidhant@gmail.com
 
 LinkedIn: linkedin.com/in/sidhant07
-```

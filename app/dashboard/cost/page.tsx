@@ -21,6 +21,7 @@
 
 import type { Metadata } from "next";
 import Link from "next/link";
+import { getActiveProjectId } from "@/lib/project-context";
 import { supabaseAdmin } from "@/lib/supabase";
 
 // ── Metadata ──────────────────────────────────────────────────────────────────
@@ -29,86 +30,86 @@ export const metadata: Metadata = { title: "Cost Analysis" };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const DAYS_WINDOW    = 30; // how far back to query
-const CHART_DAYS     = 14; // how many days the trend chart shows
+const DAYS_WINDOW = 30; // how far back to query
+const CHART_DAYS = 14; // how many days the trend chart shows
 const TOP_N_SESSIONS = 10;
 
 // Latency buckets in ms — [label, min, max]
 const LATENCY_BUCKETS: [string, number, number][] = [
-  ["<500ms",   0,    500],
-  ["0.5–1s",   500,  1000],
-  ["1–2s",     1000, 2000],
-  ["2–5s",     2000, 5000],
-  [">5s",      5000, Infinity],
+  ["<500ms", 0, 500],
+  ["0.5–1s", 500, 1000],
+  ["1–2s", 1000, 2000],
+  ["2–5s", 2000, 5000],
+  [">5s", 5000, Infinity],
 ];
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface LlmCallRaw {
-  session_id:           string;
-  model:                string;
-  tokens_in:            number | null;
-  tokens_out:           number | null;
-  latency_ms:           number;
-  estimated_cost_usd:   number | null;
-  timestamp:            string;
+  session_id: string;
+  model: string;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  latency_ms: number;
+  estimated_cost_usd: number | null;
+  timestamp: string;
 }
 
 interface DailySpend {
-  date:       string;   // "YYYY-MM-DD"
-  cost_usd:   number;
+  date: string; // "YYYY-MM-DD"
+  cost_usd: number;
   call_count: number;
 }
 
 interface ModelStat {
-  model:         string;
-  call_count:    number;
+  model: string;
+  call_count: number;
   total_cost_usd: number;
-  total_tokens:  number;
+  total_tokens: number;
   avg_latency_ms: number;
-  pct_of_total:  number;  // 0–100
+  pct_of_total: number; // 0–100
 }
 
 interface SessionCost {
-  session_id:     string;
+  session_id: string;
   total_cost_usd: number;
-  call_count:     number;
-  total_tokens:   number;
-  last_call_at:   string;
+  call_count: number;
+  total_tokens: number;
+  last_call_at: string;
 }
 
 interface LatencyBucket {
-  label:      string;
-  count:      number;
-  pct:        number;   // 0–100 of max bucket
+  label: string;
+  count: number;
+  pct: number; // 0–100 of max bucket
 }
 
 interface CostAnalytics {
   // Metric strip
-  total_cost_usd:        number;
-  total_tokens:          number;
-  total_sessions:        number;
-  avg_cost_per_session:  number;
+  total_cost_usd: number;
+  total_tokens: number;
+  total_sessions: number;
+  avg_cost_per_session: number;
   // Charts / tables
-  daily_spend:           DailySpend[];   // 14 entries, oldest → newest
-  model_stats:           ModelStat[];    // sorted by cost desc
-  top_sessions:          SessionCost[];  // top 10 by cost
-  latency_buckets:       LatencyBucket[];
+  daily_spend: DailySpend[]; // 14 entries, oldest → newest
+  model_stats: ModelStat[]; // sorted by cost desc
+  top_sessions: SessionCost[]; // top 10 by cost
+  latency_buckets: LatencyBucket[];
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function formatCost(usd: number): string {
-  if (usd === 0)     return "$0.00";
+  if (usd === 0) return "$0.00";
   if (usd < 0.0001) return `$${usd.toFixed(8).replace(/0+$/, "")}`;
-  if (usd < 0.01)   return `$${usd.toFixed(6).replace(/0+$/, "")}`;
-  if (usd < 1)      return `$${usd.toFixed(4)}`;
+  if (usd < 0.01) return `$${usd.toFixed(6).replace(/0+$/, "")}`;
+  if (usd < 1) return `$${usd.toFixed(4)}`;
   return `$${usd.toFixed(2)}`;
 }
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}k`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return n.toString();
 }
 
@@ -132,14 +133,14 @@ function shortDate(iso: string): string {
   const d = new Date(iso + "T00:00:00Z");
   return d.toLocaleDateString("en-US", {
     month: "short",
-    day:   "numeric",
+    day: "numeric",
     timeZone: "UTC",
   });
 }
 
 // ── Data fetching ─────────────────────────────────────────────────────────────
 
-async function getCostAnalytics(): Promise<CostAnalytics> {
+async function getCostAnalytics(projectId: string): Promise<CostAnalytics> {
   const since = new Date();
   since.setUTCDate(since.getUTCDate() - DAYS_WINDOW);
 
@@ -148,6 +149,7 @@ async function getCostAnalytics(): Promise<CostAnalytics> {
     .select(
       "session_id, model, tokens_in, tokens_out, latency_ms, estimated_cost_usd, timestamp",
     )
+    .eq("project_id", projectId)
     .gte("timestamp", since.toISOString())
     .order("timestamp", { ascending: false })
     .limit(10_000)) as { data: LlmCallRaw[] | null; error: Error | null };
@@ -155,19 +157,21 @@ async function getCostAnalytics(): Promise<CostAnalytics> {
   if (error || !data || data.length === 0) {
     const emptyDays = lastNDays(CHART_DAYS).map((date) => ({
       date,
-      cost_usd:   0,
+      cost_usd: 0,
       call_count: 0,
     }));
     return {
-      total_cost_usd:       0,
-      total_tokens:         0,
-      total_sessions:       0,
+      total_cost_usd: 0,
+      total_tokens: 0,
+      total_sessions: 0,
       avg_cost_per_session: 0,
-      daily_spend:          emptyDays,
-      model_stats:          [],
-      top_sessions:         [],
-      latency_buckets:      LATENCY_BUCKETS.map(([label]) => ({
-        label, count: 0, pct: 0,
+      daily_spend: emptyDays,
+      model_stats: [],
+      top_sessions: [],
+      latency_buckets: LATENCY_BUCKETS.map(([label]) => ({
+        label,
+        count: 0,
+        pct: 0,
       })),
     };
   }
@@ -179,11 +183,11 @@ async function getCostAnalytics(): Promise<CostAnalytics> {
     const existing = dailyMap.get(day);
     if (!existing) {
       dailyMap.set(day, {
-        cost_usd:   row.estimated_cost_usd ?? 0,
+        cost_usd: row.estimated_cost_usd ?? 0,
         call_count: 1,
       });
     } else {
-      existing.cost_usd   += row.estimated_cost_usd ?? 0;
+      existing.cost_usd += row.estimated_cost_usd ?? 0;
       existing.call_count += 1;
     }
   }
@@ -193,7 +197,7 @@ async function getCostAnalytics(): Promise<CostAnalytics> {
     const entry = dailyMap.get(date);
     return {
       date,
-      cost_usd:   entry?.cost_usd   ?? 0,
+      cost_usd: entry?.cost_usd ?? 0,
       call_count: entry?.call_count ?? 0,
     };
   });
@@ -209,15 +213,15 @@ async function getCostAnalytics(): Promise<CostAnalytics> {
     const existing = modelMap.get(row.model);
     if (!existing) {
       modelMap.set(row.model, {
-        cost:       row.estimated_cost_usd ?? 0,
+        cost: row.estimated_cost_usd ?? 0,
         tokens,
-        calls:      1,
+        calls: 1,
         latencySum: row.latency_ms,
       });
     } else {
-      existing.cost       += row.estimated_cost_usd ?? 0;
-      existing.tokens     += tokens;
-      existing.calls      += 1;
+      existing.cost += row.estimated_cost_usd ?? 0;
+      existing.tokens += tokens;
+      existing.calls += 1;
       existing.latencySum += row.latency_ms;
     }
   }
@@ -230,14 +234,12 @@ async function getCostAnalytics(): Promise<CostAnalytics> {
   const model_stats: ModelStat[] = Array.from(modelMap.entries())
     .map(([model, m]) => ({
       model,
-      call_count:     m.calls,
+      call_count: m.calls,
       total_cost_usd: m.cost,
-      total_tokens:   m.tokens,
+      total_tokens: m.tokens,
       avg_latency_ms: m.latencySum / m.calls,
       pct_of_total:
-        totalCostAllModels > 0
-          ? (m.cost / totalCostAllModels) * 100
-          : 0,
+        totalCostAllModels > 0 ? (m.cost / totalCostAllModels) * 100 : 0,
     }))
     .sort((a, b) => b.total_cost_usd - a.total_cost_usd);
 
@@ -252,14 +254,14 @@ async function getCostAnalytics(): Promise<CostAnalytics> {
     const existing = sessionMap.get(row.session_id);
     if (!existing) {
       sessionMap.set(row.session_id, {
-        cost:   row.estimated_cost_usd ?? 0,
-        calls:  1,
+        cost: row.estimated_cost_usd ?? 0,
+        calls: 1,
         tokens,
         lastAt: row.timestamp,
       });
     } else {
-      existing.cost   += row.estimated_cost_usd ?? 0;
-      existing.calls  += 1;
+      existing.cost += row.estimated_cost_usd ?? 0;
+      existing.calls += 1;
       existing.tokens += tokens;
       if (row.timestamp > existing.lastAt) existing.lastAt = row.timestamp;
     }
@@ -269,9 +271,9 @@ async function getCostAnalytics(): Promise<CostAnalytics> {
     .map(([session_id, s]) => ({
       session_id,
       total_cost_usd: s.cost,
-      call_count:     s.calls,
-      total_tokens:   s.tokens,
-      last_call_at:   s.lastAt,
+      call_count: s.calls,
+      total_tokens: s.tokens,
+      last_call_at: s.lastAt,
     }))
     .sort((a, b) => b.total_cost_usd - a.total_cost_usd);
 
@@ -290,17 +292,17 @@ async function getCostAnalytics(): Promise<CostAnalytics> {
     ([label], i) => ({
       label,
       count: bucketCounts[i],
-      pct:   (bucketCounts[i] / maxBucketCount) * 100,
+      pct: (bucketCounts[i] / maxBucketCount) * 100,
     }),
   );
 
   // ── Metric strip totals ────────────────────────────────────────────────────
-  const total_cost_usd  = totalCostAllModels;
-  const total_tokens    = data.reduce(
+  const total_cost_usd = totalCostAllModels;
+  const total_tokens = data.reduce(
     (s, r) => s + (r.tokens_in ?? 0) + (r.tokens_out ?? 0),
     0,
   );
-  const total_sessions  = sessionMap.size;
+  const total_sessions = sessionMap.size;
   const avg_cost_per_session =
     total_sessions > 0 ? total_cost_usd / total_sessions : 0;
 
@@ -380,7 +382,7 @@ function DailySpendChart({ days }: { days: DailySpend[] }) {
   function yLabel(val: number): string {
     if (val === 0) return "$0";
     if (val < 0.01) return `$${val.toFixed(4)}`;
-    if (val < 1)    return `$${val.toFixed(3)}`;
+    if (val < 1) return `$${val.toFixed(3)}`;
     return `$${val.toFixed(2)}`;
   }
 
@@ -413,12 +415,12 @@ function DailySpendChart({ days }: { days: DailySpend[] }) {
                 frac === 0
                   ? "bottom-0"
                   : frac === 0.25
-                  ? "top-[75%] translate-y-1/2"
-                  : frac === 0.5
-                  ? "top-[50%] translate-y-1/2"
-                  : frac === 0.75
-                  ? "top-[25%] translate-y-1/2"
-                  : "top-0 translate-y-1/2"
+                    ? "top-[75%] translate-y-1/2"
+                    : frac === 0.5
+                      ? "top-[50%] translate-y-1/2"
+                      : frac === 0.75
+                        ? "top-[25%] translate-y-1/2"
+                        : "top-0 translate-y-1/2"
               }`}
             >
               {yLabel(yMax * frac)}
@@ -504,16 +506,21 @@ function ModelBreakdown({ models }: { models: ModelStat[] }) {
       <table className="w-full border-collapse">
         <thead>
           <tr>
-            {["Model", "Calls", "Total Cost", "% of Spend", "Total Tokens", "Avg Latency"].map(
-              (h) => (
-                <th
-                  key={h}
-                  className="h-10 text-left border-b border-[#1f1f1f] px-6 text-[#71717a] text-[11px] uppercase tracking-[0.05em] font-medium whitespace-nowrap"
-                >
-                  {h}
-                </th>
-              ),
-            )}
+            {[
+              "Model",
+              "Calls",
+              "Total Cost",
+              "% of Spend",
+              "Total Tokens",
+              "Avg Latency",
+            ].map((h) => (
+              <th
+                key={h}
+                className="h-10 text-left border-b border-[#1f1f1f] px-6 text-[#71717a] text-[11px] uppercase tracking-[0.05em] font-medium whitespace-nowrap"
+              >
+                {h}
+              </th>
+            ))}
           </tr>
         </thead>
         <tbody>
@@ -604,8 +611,7 @@ function TopSessions({ sessions }: { sessions: SessionCost[] }) {
 
       <div className="divide-y divide-[#1f1f1f]">
         {sessions.map((s, idx) => {
-          const barWidth =
-            maxCost > 0 ? (s.total_cost_usd / maxCost) * 100 : 0;
+          const barWidth = maxCost > 0 ? (s.total_cost_usd / maxCost) * 100 : 0;
 
           return (
             <div
@@ -631,7 +637,7 @@ function TopSessions({ sessions }: { sessions: SessionCost[] }) {
                   <div
                     className="h-full rounded-full transition-all"
                     style={{
-                      width:           `${barWidth}%`,
+                      width: `${barWidth}%`,
                       backgroundColor: idx === 0 ? "#f59e0b" : "#3b82f6",
                     }}
                   />
@@ -682,11 +688,15 @@ function LatencyDistribution({ buckets }: { buckets: LatencyBucket[] }) {
         {buckets.map((bucket) => {
           // Color: fast = emerald, mid = blue, slow = amber, very slow = rose
           const color =
-            bucket.label === "<500ms"  ? "#10b981" :
-            bucket.label === "0.5–1s"  ? "#3b82f6" :
-            bucket.label === "1–2s"    ? "#3b82f6" :
-            bucket.label === "2–5s"    ? "#f59e0b" :
-                                         "#f43f5e";
+            bucket.label === "<500ms"
+              ? "#10b981"
+              : bucket.label === "0.5–1s"
+                ? "#3b82f6"
+                : bucket.label === "1–2s"
+                  ? "#3b82f6"
+                  : bucket.label === "2–5s"
+                    ? "#f59e0b"
+                    : "#f43f5e";
 
           const callPct =
             total > 0 ? ((bucket.count / total) * 100).toFixed(1) : "0";
@@ -703,7 +713,7 @@ function LatencyDistribution({ buckets }: { buckets: LatencyBucket[] }) {
                 <div
                   className="h-full rounded-full transition-all"
                   style={{
-                    width:           `${bucket.pct}%`,
+                    width: `${bucket.pct}%`,
                     backgroundColor: color,
                   }}
                 />
@@ -714,9 +724,7 @@ function LatencyDistribution({ buckets }: { buckets: LatencyBucket[] }) {
                 <span className="text-[#a1a1aa] text-[12px]">
                   {bucket.count.toLocaleString()}
                 </span>
-                <span className="text-[#52525b] text-[11px]">
-                  ({callPct}%)
-                </span>
+                <span className="text-[#52525b] text-[11px]">({callPct}%)</span>
               </div>
             </div>
           );
@@ -729,7 +737,8 @@ function LatencyDistribution({ buckets }: { buckets: LatencyBucket[] }) {
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default async function CostAnalyticsPage() {
-  const analytics = await getCostAnalytics();
+  const projectId = await getActiveProjectId();
+  const analytics = await getCostAnalytics(projectId);
 
   return (
     <div>
@@ -758,9 +767,9 @@ export default async function CostAnalyticsPage() {
       {/* ── Bottom row: top sessions + latency distribution ── */}
       <div
         style={{
-          display:             "grid",
+          display: "grid",
           gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)",
-          gap:                 "24px",
+          gap: "24px",
         }}
       >
         <TopSessions sessions={analytics.top_sessions} />

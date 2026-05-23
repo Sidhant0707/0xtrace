@@ -4,6 +4,7 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { supabaseAdmin } from "@/lib/supabase";
+import { getActiveProjectId } from "@/lib/project-context";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -178,6 +179,7 @@ function truncateContent(content: string | null, role: string): string {
 async function getDiffPageData(
   sessionId: string,
   stepIndex: number,
+  projectId: string,
 ): Promise<{
   snapshots: SnapshotRow[];
   callMeta: CallMetaRaw;
@@ -188,6 +190,7 @@ async function getDiffPageData(
       .from("prompt_snapshots")
       .select("call_id, step_index, full_snapshot, diff_from_previous")
       .eq("session_id", sessionId)
+      .eq("project_id", projectId)
       .lte("step_index", stepIndex)
       .order("step_index", { ascending: true }) as unknown as Promise<{
       data: SnapshotRow[] | null;
@@ -201,6 +204,7 @@ async function getDiffPageData(
           "estimated_cost_usd, is_stream, timestamp, metadata",
       )
       .eq("session_id", sessionId)
+      .eq("project_id", projectId)
       .order("timestamp", { ascending: true })
       .range(stepIndex - 1, stepIndex - 1) as unknown as Promise<{
       data: CallMetaRaw[] | null;
@@ -210,7 +214,8 @@ async function getDiffPageData(
     supabaseAdmin
       .from("llm_calls")
       .select("id", { count: "exact", head: true })
-      .eq("session_id", sessionId) as unknown as Promise<{
+      .eq("session_id", sessionId)
+      .eq("project_id", projectId) as unknown as Promise<{
       count: number | null;
       error: Error | null;
     }>,
@@ -386,8 +391,9 @@ export default async function DiffViewerPage({
   const sp = await searchParams;
   const rawStep = typeof sp.step === "string" ? parseInt(sp.step, 10) : NaN;
   const stepIndex = Number.isNaN(rawStep) || rawStep < 1 ? 1 : rawStep;
+  const projectId = await getActiveProjectId();
 
-  const result = await getDiffPageData(sessionId, stepIndex);
+  const result = await getDiffPageData(sessionId, stepIndex, projectId);
   if (!result) notFound();
 
   const { snapshots, callMeta, totalSteps } = result;

@@ -18,6 +18,7 @@
 
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
+import { getActiveProjectId } from "@/lib/project-context";
 import Link from "next/link";
 import { supabaseAdmin } from "@/lib/supabase";
 
@@ -147,7 +148,10 @@ function classifyStep(
 
 // ── Data fetching ─────────────────────────────────────────────────────────────
 
-async function getSessionData(sessionId: string): Promise<{
+async function getSessionData(
+  projectId: string,
+  sessionId: string,
+): Promise<{
   summary: SessionSummary;
   steps: StepData[];
 } | null> {
@@ -158,6 +162,7 @@ async function getSessionData(sessionId: string): Promise<{
         "estimated_cost_usd, metadata, timestamp",
     )
     .eq("session_id", sessionId)
+    .eq("project_id", projectId)
     .order("timestamp", { ascending: true })
     .limit(200)) as { data: LlmCallRaw[] | null; error: Error | null };
 
@@ -473,8 +478,9 @@ function StepCard({ step, sessionId }: StepCardProps) {
 
 export default async function SessionDetailPage({ params }: PageProps) {
   const { SessionId } = await params;
+  const projectId = await getActiveProjectId();
+  const result = await getSessionData(SessionId, projectId);
 
-  const result = await getSessionData(SessionId);
   if (!result) notFound();
 
   const { summary, steps } = result;

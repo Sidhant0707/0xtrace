@@ -26,6 +26,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { supabaseAdmin } from "@/lib/supabase";
+import { getActiveProjectId } from "@/lib/project-context";
 
 // ── Metadata ──────────────────────────────────────────────────────────────────
 
@@ -269,7 +270,7 @@ function detectAnomalies(data: LlmCallRaw[]): AnomalyItem[] {
 
 // ── Data fetching ─────────────────────────────────────────────────────────────
 
-async function getAnomalyData(): Promise<AnomalyItem[]> {
+async function getAnomalyData(projectId: string): Promise<AnomalyItem[]> {
   const since = new Date();
   since.setUTCDate(since.getUTCDate() - DAYS_WINDOW);
 
@@ -279,6 +280,7 @@ async function getAnomalyData(): Promise<AnomalyItem[]> {
       "id, session_id, model, tokens_in, tokens_out, " +
         "latency_ms, estimated_cost_usd, metadata, timestamp",
     )
+    .eq("project_id", projectId)
     .gte("timestamp", since.toISOString())
     .order("timestamp", { ascending: false })
     .limit(10_000)) as { data: LlmCallRaw[] | null; error: Error | null };
@@ -607,7 +609,8 @@ function EmptyState() {
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default async function AnomaliesPage() {
-  const anomalies = await getAnomalyData();
+  const projectId = await getActiveProjectId();
+  const anomalies = await getAnomalyData(projectId);
 
   const criticalCount = anomalies.filter(
     (a) => a.severity === "critical",

@@ -765,13 +765,7 @@ export default async function CostAnalyticsPage() {
       <ModelBreakdown models={analytics.model_stats} />
 
       {/* ── Bottom row: top sessions + latency distribution ── */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)",
-          gap: "24px",
-        }}
-      >
+      <div className="grid grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)] gap-6">
         <TopSessions sessions={analytics.top_sessions} />
         <LatencyDistribution buckets={analytics.latency_buckets} />
       </div>

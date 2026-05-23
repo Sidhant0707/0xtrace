@@ -113,7 +113,7 @@ function NewKeyReveal({
         onClick={onDismiss}
         className="mt-3 text-[#52525b] text-[12px] hover:text-[#a1a1aa] transition-colors"
       >
-        I've saved it — dismiss
+        I&apos;ve saved it — dismiss
       </button>
     </div>
   );

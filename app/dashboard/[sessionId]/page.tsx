@@ -44,8 +44,10 @@ interface LlmCall {
 async function getSessionData(projectId: string, sessionId: string) {
   const { data, error } = await supabaseAdmin
     .from("llm_calls")
-    .select("*")
-    .eq("project_id", projectId) // ← Security: scope to project
+    .select(
+      "call_id, session_id, step_index, model, tokens_in, tokens_out, latency_ms, estimated_cost_usd, is_stream, timestamp, metadata",
+    )
+    .eq("project_id", projectId)
     .eq("session_id", sessionId)
     .order("step_index", { ascending: true });
 

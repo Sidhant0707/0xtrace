@@ -1,16 +1,18 @@
 // lib/project-context.ts
+// ============================================================================
+// Project Context Utility (v2)
+// ============================================================================
+// Retrieves the active project from cookie with fallback to first project.
+// Cookie is a UX preference only — RLS enforces actual data ownership.
 //
-// Server-side utilities for reading the active project.
-//
-// Architecture:
-//   - Active project is stored in a cookie: `oxtr_project`
-//   - All dashboard queries use the active project ID to filter data
-//   - getUserProjects() relies on RLS — only returns projects the user owns
-//   - getActiveProject() validates that the cookied project belongs to the user
-//     before trusting it, preventing ID-spoofing attacks
+// Resolution order:
+//   1. Cookie `oxtr_project` — if valid and owned by the user
+//   2. First project in user's list — fallback for first login
+//   3. null — user has no projects → redirect to /onboarding
 
-import { cookies }       from "next/headers";
-import { createClient }  from "@/lib/supabase-server";
+import { cookies }      from "next/headers";
+import { redirect }     from "next/navigation";
+import { createClient } from "@/lib/supabase-server";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -22,6 +24,8 @@ export interface Project {
   id:         string;
   name:       string;
   created_at: string;
+  updated_at: string;
+  user_id:    string;
 }
 
 // ── Queries ───────────────────────────────────────────────────────────────────
@@ -35,7 +39,7 @@ export async function getUserProjects(): Promise<Project[]> {
 
   const { data, error } = await supabase
     .from("projects")
-    .select("id, name, created_at")
+    .select("id, name, created_at, updated_at, user_id")
     .order("created_at", { ascending: true });
 
   if (error) {
@@ -50,9 +54,9 @@ export async function getUserProjects(): Promise<Project[]> {
  * Returns the active project for the current request.
  *
  * Resolution order:
- *   1. Cookie `oxtr_project` — if valid and owned by the user
- *   2. First project in the user's list — fallback if cookie is stale/missing
- *   3. null — user has no projects (should redirect to /onboarding)
+ *   1. Cookie `oxtr_project` — validated via RLS
+ *   2. First project in user's list — first login fallback
+ *   3. null — user has no projects
  */
 export async function getActiveProject(): Promise<Project | null> {
   const supabase    = await createClient();
@@ -63,24 +67,30 @@ export async function getActiveProject(): Promise<Project | null> {
   if (cookieValue) {
     const { data } = await supabase
       .from("projects")
-      .select("id, name, created_at")
+      .select("id, name, created_at, updated_at, user_id")
       .eq("id", cookieValue)
       .single();
 
-    // RLS will return null if the project doesn't belong to this user
+    // RLS returns null if project doesn't belong to this user
     if (data) return data as Project;
   }
 
   // ── Fall back to the first project ────────────────────────────────────────
+  // Handles first login where the cookie was never set.
   const projects = await getUserProjects();
   return projects[0] ?? null;
 }
 
 /**
  * Returns only the active project's ID — used in data queries.
- * Returns null when the user has no projects.
+ * Redirects to /onboarding if the user has no projects.
  */
-export async function getActiveProjectId(): Promise<string | null> {
+export async function getActiveProjectId(): Promise<string> {
   const project = await getActiveProject();
-  return project?.id ?? null;
+
+  if (!project) {
+    redirect("/onboarding");
+  }
+
+  return project.id;
 }

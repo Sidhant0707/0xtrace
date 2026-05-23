@@ -1,27 +1,101 @@
+// lib/queries.ts
+// ============================================================================
+// Scoped Data Queries for Dashboard (v2 Optimized)
+// ============================================================================
+// All queries enforce project-level data isolation via project_id filtering.
+// Uses admin client (bypasses RLS) → manual filtering is CRITICAL for security.
+
 import { createClient } from "@supabase/supabase-js";
 import { formatCostUsd } from "@/lib/cost";
 
-// Standard Supabase client (Server-side read-only)
-const supabase = createClient(
+// ── Supabase Admin Client ─────────────────────────────────────────────────────
+// Bypasses RLS → we MUST manually filter by project_id in every query
+const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-// ── 1. The Command Center: Global KPIs ───────────────────────────────────────
-export async function getGlobalKPIs() {
-  const { data, error } = await supabase
-    .from("llm_calls")
-    .select("session_id, tokens_in, tokens_out, estimated_cost_usd");
+// ── Type Definitions ──────────────────────────────────────────────────────────
 
-  if (error || !data) {
-    console.error("Failed to fetch KPIs:", error);
+export interface LlmCallBase {
+  session_id: string;
+  model: string;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  estimated_cost_usd: number | null;
+  latency_ms: number;
+  timestamp: string;
+  metadata?: Record<string, unknown> | null;
+}
+
+export interface GlobalKPIs {
+  totalCost: string;
+  totalTokens: string;
+  totalSessions: number;
+}
+
+export interface AggregatedSession {
+  sessionId: string;
+  totalTokens: number;
+  totalCost: number;
+  steps: number;
+}
+
+export interface CostByModel {
+  model: string;
+  cost: number;
+}
+
+export interface AnomalySession {
+  sessionId: string;
+  model: string;
+  latencyMs: number;
+  timestamp: string;
+  reason: "High Latency" | "Error in Metadata";
+}
+
+export interface RecentActivity {
+  session_id: string;
+  model: string;
+  timestamp: string;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  estimated_cost_usd: number | null;
+}
+
+// ── 1. Global KPIs ────────────────────────────────────────────────────────────
+
+/**
+ * Fetch aggregated KPIs for a project.
+ * @param projectId - UUID of the project
+ * @returns Total cost, total tokens, and unique session count
+ */
+export async function getGlobalKPIs(projectId: string): Promise<GlobalKPIs> {
+  const { data, error } = await supabaseAdmin
+    .from("llm_calls")
+    .select("session_id, tokens_in, tokens_out, estimated_cost_usd")
+    .eq("project_id", projectId);
+
+  if (error) {
+    console.error("[getGlobalKPIs] Query failed:", error.message);
+    return { totalCost: "$0.00", totalTokens: "0", totalSessions: 0 };
+  }
+
+  if (!data || data.length === 0) {
     return { totalCost: "$0.00", totalTokens: "0", totalSessions: 0 };
   }
 
   const uniqueSessions = new Set(data.map((row) => row.session_id));
-  
-  const totalCost = data.reduce((sum, row) => sum + (row.estimated_cost_usd || 0), 0);
-  const totalTokens = data.reduce((sum, row) => sum + (row.tokens_in || 0) + (row.tokens_out || 0), 0);
+
+  const totalCost = data.reduce(
+    (sum, row) => sum + (row.estimated_cost_usd ?? 0),
+    0
+  );
+
+  const totalTokens = data.reduce(
+    (sum, row) => sum + (row.tokens_in ?? 0) + (row.tokens_out ?? 0),
+    0
+  );
 
   return {
     totalCost: formatCostUsd(totalCost),
@@ -30,75 +104,217 @@ export async function getGlobalKPIs() {
   };
 }
 
-// ── 2. The Command Center: Context Bleed Leaderboard ─────────────────────────
+// ── 2. Top Bloated Sessions ───────────────────────────────────────────────────
 
-// Strictly typing the accumulator to block `any`
-export interface AggregatedSession {
-  sessionId: string;
-  totalTokens: number;
-  totalCost: number;
-  steps: number;
-}
-
-export async function getTopBloatedSessions(limit = 5): Promise<AggregatedSession[]> {
-  const { data, error } = await supabase
+/**
+ * Get sessions with highest token usage (context bloat analysis).
+ * @param projectId - UUID of the project
+ * @param limit - Number of top sessions to return (default: 5)
+ * @returns Sessions sorted by total tokens descending
+ */
+export async function getTopBloatedSessions(
+  projectId: string,
+  limit = 5
+): Promise<AggregatedSession[]> {
+  const { data, error } = await supabaseAdmin
     .from("llm_calls")
     .select("session_id, step_index, tokens_in, tokens_out, estimated_cost_usd")
+    .eq("project_id", projectId)
     .order("session_id")
     .order("step_index", { ascending: true });
 
-  if (error || !data) return [];
+  if (error) {
+    console.error("[getTopBloatedSessions] Query failed:", error.message);
+    return [];
+  }
 
-  // Enforcing the Record type so `acc` is no longer `any`
-  const aggregated = data.reduce<Record<string, AggregatedSession>>((acc, row) => {
-    if (!acc[row.session_id]) {
-      acc[row.session_id] = { 
-        sessionId: row.session_id, 
-        totalTokens: 0, 
-        totalCost: 0, 
-        steps: 0 
-      };
-    }
-    acc[row.session_id].totalTokens += (row.tokens_in || 0) + (row.tokens_out || 0);
-    acc[row.session_id].totalCost += row.estimated_cost_usd || 0;
-    acc[row.session_id].steps += 1;
-    
-    return acc;
-  }, {});
+  if (!data || data.length === 0) return [];
 
-  // TypeScript now natively knows `a` and `b` are `AggregatedSession` objects
-  return Object.values(aggregated)
+  // Aggregate by session_id
+  const sessionMap = data.reduce<Record<string, AggregatedSession>>(
+    (acc, row) => {
+      const sid = row.session_id;
+
+      if (!acc[sid]) {
+        acc[sid] = {
+          sessionId: sid,
+          totalTokens: 0,
+          totalCost: 0,
+          steps: 0,
+        };
+      }
+
+      acc[sid].totalTokens += (row.tokens_in ?? 0) + (row.tokens_out ?? 0);
+      acc[sid].totalCost += row.estimated_cost_usd ?? 0;
+      acc[sid].steps += 1;
+
+      return acc;
+    },
+    {}
+  );
+
+  return Object.values(sessionMap)
     .sort((a, b) => b.totalTokens - a.totalTokens)
     .slice(0, limit);
 }
 
-// ── 3. The Session Explorer: Waterfall Timeline ──────────────────────────────
-export async function getSessionTimeline(sessionId: string) {
-  const { data, error } = await supabase
+// ── 3. Session Details ────────────────────────────────────────────────────────
+
+/**
+ * Get all LLM calls for a specific session.
+ * @param projectId - UUID of the project
+ * @param sessionId - Session identifier
+ * @returns Array of calls sorted by step_index ascending
+ */
+export async function getSessionDetails(
+  projectId: string,
+  sessionId: string
+) {
+  const { data, error } = await supabaseAdmin
     .from("llm_calls")
-    .select("step_index, model, latency_ms, tokens_in, tokens_out, estimated_cost_usd, timestamp")
+    .select("*")
+    .eq("project_id", projectId)
     .eq("session_id", sessionId)
     .order("step_index", { ascending: true });
 
   if (error) {
-    console.error(`Failed to fetch timeline for ${sessionId}:`, error);
+    console.error("[getSessionDetails] Query failed:", error.message);
     return [];
   }
 
-  return data;
+  return data ?? [];
 }
 
-// ── 4. The Replay Engine: Context Visualizer ─────────────────────────────────
-export async function getPromptSnapshot(sessionId: string, stepIndex: number) {
-  const { data, error } = await supabase
-    .from("prompt_snapshots")
-    .select("full_snapshot, diff_from_previous")
-    .eq("session_id", sessionId)
-    .eq("step_index", stepIndex)
-    .single();
+// ── 4. Cost by Model ──────────────────────────────────────────────────────────
+
+/**
+ * Aggregate cost breakdown by model.
+ * @param projectId - UUID of the project
+ * @returns Models sorted by cost descending
+ */
+export async function getCostByModel(
+  projectId: string
+): Promise<CostByModel[]> {
+  const { data, error } = await supabaseAdmin
+    .from("llm_calls")
+    .select("model, estimated_cost_usd")
+    .eq("project_id", projectId);
 
   if (error) {
-    console.error(`Failed to fetch snapshot for ${sessionId} step ${stepIndex}:`, error);
+    console.error("[getCostByModel] Query failed:", error.message);
+    return [];
+  }
+
+  if (!data || data.length === 0) return [];
+
+  // Aggregate by model
+  const costMap = data.reduce<Record<string, number>>((acc, row) => {
+    const model = row.model || "unknown";
+    acc[model] = (acc[model] ?? 0) + (row.estimated_cost_usd ?? 0);
+    return acc;
+  }, {});
+
+  return Object.entries(costMap)
+    .map(([model, cost]) => ({ model, cost }))
+    .sort((a, b) => b.cost - a.cost);
+}
+
+// ── 5. Anomaly Detection ──────────────────────────────────────────────────────
+
+/**
+ * Detect anomalous sessions based on latency and error metadata.
+ * @param projectId - UUID of the project
+ * @returns Sessions flagged as anomalous with reason
+ */
+export async function getAnomalySessions(
+  projectId: string
+): Promise<AnomalySession[]> {
+  const { data, error } = await supabaseAdmin
+    .from("llm_calls")
+    .select("session_id, model, latency_ms, timestamp, metadata")
+    .eq("project_id", projectId)
+    .order("timestamp", { ascending: false });
+
+  if (error) {
+    console.error("[getAnomalySessions] Query failed:", error.message);
+    return [];
+  }
+
+  if (!data || data.length === 0) return [];
+
+  const HIGH_LATENCY_THRESHOLD = 10000; // 10 seconds
+
+  return data
+    .filter((row) => {
+      const isHighLatency = row.latency_ms > HIGH_LATENCY_THRESHOLD;
+      const hasError =
+        row.metadata && JSON.stringify(row.metadata).includes("error");
+      return isHighLatency || hasError;
+    })
+    .map((row) => ({
+      sessionId: row.session_id,
+      model: row.model,
+      latencyMs: row.latency_ms,
+      timestamp: row.timestamp,
+      reason:
+        row.latency_ms > HIGH_LATENCY_THRESHOLD
+          ? "High Latency"
+          : "Error in Metadata",
+    }));
+}
+
+// ── 6. Recent Activity ────────────────────────────────────────────────────────
+
+/**
+ * Get most recent LLM calls for a project.
+ * @param projectId - UUID of the project
+ * @param limit - Number of calls to return (default: 10)
+ * @returns Recent calls sorted by timestamp descending
+ */
+export async function getRecentActivity(
+  projectId: string,
+  limit = 10
+): Promise<RecentActivity[]> {
+  const { data, error } = await supabaseAdmin
+    .from("llm_calls")
+    .select(
+      "session_id, model, timestamp, tokens_in, tokens_out, estimated_cost_usd"
+    )
+    .eq("project_id", projectId)
+    .order("timestamp", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    console.error("[getRecentActivity] Query failed:", error.message);
+    return [];
+  }
+
+  return data ?? [];
+}
+
+// ── 7. Utility: Safe Query Wrapper ───────────────────────────────────────────
+
+/**
+ * Generic wrapper for safe query execution with logging.
+ * Use this for custom queries that need project scoping.
+ * 
+ * @example
+ * const sessions = await safeQuery(
+ *   "custom_query",
+ *   supabaseAdmin
+ *     .from("llm_calls")
+ *     .select("session_id")
+ *     .eq("project_id", projectId)
+ * );
+ */
+export async function safeQuery<T>(
+  queryName: string,
+  query: Promise<{ data: T | null; error: Error | null }>
+): Promise<T | null> {
+  const { data, error } = await query;
+
+  if (error) {
+    console.error(`[${queryName}] Query failed:`, error instanceof Error ? error.message : error);
     return null;
   }
 

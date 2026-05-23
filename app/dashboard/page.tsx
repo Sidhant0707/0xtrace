@@ -1,20 +1,7 @@
 // app/dashboard/page.tsx
-//
-// Sessions list — the landing page of the dashboard.
-//
-// Data architecture:
-//   - This file is a Server Component. All Supabase queries run at
-//     request time on the server. Zero client-side fetching.
-//   - The metric strip aggregates are computed in a single SQL query
-//     using Supabase's aggregate select syntax, not N+1 JS loops.
-//   - The <SessionsTable> below is "use client" only because it needs
-//     sort/search/filter interactivity. It receives fully-typed, already-
-//     fetched data as props — no SWR, no useEffect fetches.
-//
-// URL search params used for server-side filtering:
-//   ?model=gpt-4o        filter by model
-//   ?status=anomaly      filter by status
-//   ?q=sess-9e4d         search by session ID prefix
+// ============================================================================
+// UPDATED FOR v2 MULTI-TENANCY - All queries now scoped to project_id
+// ============================================================================
 
 import type { Metadata } from "next";
 import type { SearchParams } from "@/types/next";
@@ -22,7 +9,8 @@ import { supabaseAdmin } from "@/lib/supabase";
 import { SessionsTable } from "@/components/dashboard/SessionsTable";
 import { MetricCard } from "@/components/dashboard/MetricCard";
 import { formatCostUsd } from "@/lib/cost";
-// Add this interface at the top of page.tsx, after the imports
+import { getActiveProjectId } from "@/lib/project-context"; // ← CRITICAL: Added import
+
 interface LlmCallRaw {
   session_id: string;
   model: string;
@@ -69,11 +57,14 @@ interface PageProps {
 
 // ── Data fetching ─────────────────────────────────────────────────────────────
 
-async function getSessions(filters: {
-  model?: string;
-  status?: string;
-  q?: string;
-}): Promise<SessionRow[]> {
+async function getSessions(
+  projectId: string, // ← CRITICAL: Added parameter
+  filters: {
+    model?: string;
+    status?: string;
+    q?: string;
+  },
+): Promise<SessionRow[]> {
   // We aggregate per session_id in JS because Supabase's PostgREST
   // doesn't support GROUP BY. For production scale, replace with a
   // Postgres view or RPC function.
@@ -83,6 +74,7 @@ async function getSessions(filters: {
       "session_id, model, tokens_in, tokens_out, latency_ms, " +
         "estimated_cost_usd, metadata, timestamp",
     )
+    .eq("project_id", projectId) // ← CRITICAL: Added filter
     .order("timestamp", { ascending: false });
 
   if (filters.model) {
@@ -154,12 +146,13 @@ async function getSessions(filters: {
   return sessions;
 }
 
-async function getMetrics(): Promise<DashboardMetrics> {
+async function getMetrics(projectId: string): Promise<DashboardMetrics> {
+  // ← CRITICAL: Added parameter
   const { data, error } = (await supabaseAdmin
     .from("llm_calls")
-    .select(
-      "tokens_in, tokens_out, latency_ms, estimated_cost_usd, metadata",
-    )) as {
+    .select("tokens_in, tokens_out, latency_ms, estimated_cost_usd, metadata")
+    .eq("project_id", projectId)) as {
+    // ← CRITICAL: Added filter
     data:
       | Pick<
           LlmCallRaw,
@@ -199,8 +192,12 @@ async function getMetrics(): Promise<DashboardMetrics> {
   return { total_calls, total_cost_usd, avg_latency_ms, anomaly_count };
 }
 
-async function getDistinctModels(): Promise<string[]> {
-  const { data, error } = await supabaseAdmin.from("llm_calls").select("model");
+async function getDistinctModels(projectId: string): Promise<string[]> {
+  // ← CRITICAL: Added parameter
+  const { data, error } = await supabaseAdmin
+    .from("llm_calls")
+    .select("model")
+    .eq("project_id", projectId); // ← CRITICAL: Added filter
 
   if (error || !data) return [];
 
@@ -211,17 +208,19 @@ async function getDistinctModels(): Promise<string[]> {
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default async function SessionsPage({ searchParams }: PageProps) {
+  // ── CRITICAL: Get active project ID (validates ownership) ────────────────
+  const projectId = await getActiveProjectId();
+
   const params = await searchParams;
-  const model =
-    typeof params.model === "string" ? params.model : undefined;
-  const status =
-    typeof params.status === "string" ? params.status : undefined;
+  const model = typeof params.model === "string" ? params.model : undefined;
+  const status = typeof params.status === "string" ? params.status : undefined;
   const q = typeof params.q === "string" ? params.q : undefined;
 
+  // ── CRITICAL: Pass projectId to all functions ─────────────────────────────
   const [sessions, metrics, models] = await Promise.all([
-    getSessions({ model, status, q }),
-    getMetrics(),
-    getDistinctModels(),
+    getSessions(projectId, { model, status, q }),
+    getMetrics(projectId),
+    getDistinctModels(projectId),
   ]);
 
   return (

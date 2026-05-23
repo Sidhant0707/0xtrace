@@ -1,8 +1,8 @@
 # 0xtrace
 
-**[🔴 Live Demo](https://0xtrace-mu.vercel.app/)**
+**[→ Live Demo](https://0xtrace-mu.vercel.app/)**
 
-![0xtrace Dashboard](./public/0xtrace-dashboard-preview.png)
+![0xtrace Dashboard](https://raw.githubusercontent.com/Sidhant0707/0xtrace/main/0xtrace-dashboard-preview.png)
 
 > AI observability infrastructure for LLM applications. Intercept every call, visualize prompt deltas, and kill context bloat before it kills your budget.
 

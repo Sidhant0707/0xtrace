@@ -2,13 +2,36 @@
 "use client";
 
 import { useState } from "react";
-import type {
-  StepDetails,
-  PromptSnapshot,
-} from "@/app/dashboard/sessions/[id]/page";
 import type { ChatMessage } from "@/packages/sdk/src/core/types";
 
+// ── Types (moved inline — source file was deleted) ────────────────────────────
+
+interface StepDetails {
+  step_index: number;
+  model: string;
+  latency_ms: number;
+  tokens_in: number;
+  tokens_out: number;
+  estimated_cost_usd: number;
+  timestamp: string;
+  has_anomaly: boolean;
+}
+
+interface JsonDiffDelta {
+  path: (string | number)[];
+  type: "added" | "removed" | "modified";
+  oldValue?: unknown;
+  newValue?: unknown;
+}
+
+interface PromptSnapshot {
+  step_index: number;
+  full_snapshot: ChatMessage[] | null;
+  diff_from_previous: JsonDiffDelta[] | null;
+}
+
 // ── Actual shape stored by drain-queue cron via lib/diff.ts ──────────────────
+
 interface StoredDiff {
   added: ChatMessage[];
   removed: ChatMessage[];
@@ -30,7 +53,6 @@ export function SessionExplorer({ timeline, snapshots }: SessionExplorerProps) {
     (s) => s.step_index === activeStepIndex,
   );
 
-  // Cast the raw JSONB from Supabase to our known shape
   const diff = activeSnapshot?.diff_from_previous
     ? (activeSnapshot.diff_from_previous as unknown as StoredDiff)
     : null;
@@ -122,13 +144,11 @@ export function SessionExplorer({ timeline, snapshots }: SessionExplorerProps) {
         </div>
 
         <div className="flex-1 overflow-y-auto bg-[#0a0a0a] p-4 text-sm font-mono leading-relaxed">
-          {/* ── No snapshot at all ── */}
           {!activeSnapshot ? (
             <div className="h-full flex items-center justify-center text-zinc-600">
               No snapshot data available for this step.
             </div>
-          ) : /* ── Step 1 or fallback: full snapshot ── */
-          activeSnapshot.full_snapshot ? (
+          ) : activeSnapshot.full_snapshot ? (
             <div className="space-y-6">
               {activeSnapshot.full_snapshot.map(
                 (msg: ChatMessage, idx: number) => (
@@ -159,10 +179,8 @@ export function SessionExplorer({ timeline, snapshots }: SessionExplorerProps) {
                 ),
               )}
             </div>
-          ) : /* ── Steps 2+: diff view ── */
-          diff ? (
+          ) : diff ? (
             <div className="space-y-4">
-              {/* Delta header */}
               <div className="flex items-center gap-3 mb-2">
                 <span className="text-xs text-zinc-500 uppercase tracking-widest">
                   Changes from previous step
@@ -180,7 +198,6 @@ export function SessionExplorer({ timeline, snapshots }: SessionExplorerProps) {
                 </span>
               </div>
 
-              {/* Removed messages */}
               {diff.removed.length > 0 && (
                 <div className="space-y-2">
                   <div className="text-[10px] uppercase tracking-widest text-rose-500 font-medium">
@@ -202,7 +219,6 @@ export function SessionExplorer({ timeline, snapshots }: SessionExplorerProps) {
                 </div>
               )}
 
-              {/* Added messages */}
               {diff.added.length > 0 && (
                 <div className="space-y-2">
                   <div className="text-[10px] uppercase tracking-widest text-emerald-500 font-medium">
@@ -224,7 +240,6 @@ export function SessionExplorer({ timeline, snapshots }: SessionExplorerProps) {
                 </div>
               )}
 
-              {/* No changes edge case */}
               {diff.removed.length === 0 && diff.added.length === 0 && (
                 <div className="flex items-center justify-center py-8 text-zinc-600 text-xs">
                   No message changes this step — only token count shifted.
@@ -232,7 +247,6 @@ export function SessionExplorer({ timeline, snapshots }: SessionExplorerProps) {
               )}
             </div>
           ) : (
-            /* ── Snapshot exists but both fields are null ── */
             <div className="h-full flex items-center justify-center text-zinc-600">
               Snapshot structure is invalid or empty.
             </div>

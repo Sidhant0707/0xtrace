@@ -1,0 +1,9 @@
+node_modules
+.next
+dist
+public
+package-lock.json
+postcss.config.js
+tailwind.config.ts
+.eslintrc.json
+.gitignore

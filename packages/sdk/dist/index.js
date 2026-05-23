@@ -1,0 +1,430 @@
+var __defProp = Object.defineProperty;
+var __defProps = Object.defineProperties;
+var __getOwnPropDescs = Object.getOwnPropertyDescriptors;
+var __getOwnPropSymbols = Object.getOwnPropertySymbols;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __propIsEnum = Object.prototype.propertyIsEnumerable;
+var __knownSymbol = (name, symbol) => (symbol = Symbol[name]) ? symbol : /* @__PURE__ */ Symbol.for("Symbol." + name);
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __spreadValues = (a, b) => {
+  for (var prop in b || (b = {}))
+    if (__hasOwnProp.call(b, prop))
+      __defNormalProp(a, prop, b[prop]);
+  if (__getOwnPropSymbols)
+    for (var prop of __getOwnPropSymbols(b)) {
+      if (__propIsEnum.call(b, prop))
+        __defNormalProp(a, prop, b[prop]);
+    }
+  return a;
+};
+var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
+var __await = function(promise, isYieldStar) {
+  this[0] = promise;
+  this[1] = isYieldStar;
+};
+var __asyncGenerator = (__this, __arguments, generator) => {
+  var resume = (k, v, yes, no) => {
+    try {
+      var x = generator[k](v), isAwait = (v = x.value) instanceof __await, done = x.done;
+      Promise.resolve(isAwait ? v[0] : v).then((y) => isAwait ? resume(k === "return" ? k : "next", v[1] ? { done: y.done, value: y.value } : y, yes, no) : yes({ value: y, done })).catch((e) => resume("throw", e, yes, no));
+    } catch (e) {
+      no(e);
+    }
+  }, method = (k, call, wait, clear) => it[k] = (x) => (call = new Promise((yes, no, run) => (run = () => resume(k, x, yes, no), q ? q.then(run) : run())), clear = () => q === wait && (q = 0), q = wait = call.then(clear, clear), call), q, it = {};
+  return generator = generator.apply(__this, __arguments), it[__knownSymbol("asyncIterator")] = () => it, method("next"), method("throw"), method("return"), it;
+};
+var __forAwait = (obj, it, method) => (it = obj[__knownSymbol("asyncIterator")]) ? it.call(obj) : (obj = obj[__knownSymbol("iterator")](), it = {}, method = (key, fn) => (fn = obj[key]) && (it[key] = (arg) => new Promise((yes, no, done) => (arg = fn.call(obj, arg), done = arg.done, Promise.resolve(arg.value).then((value) => yes({ value, done }), no)))), method("next"), method("return"), it);
+
+// src/core/dispatcher.ts
+var DEFAULT_BATCH_SIZE = 10;
+var DEFAULT_FLUSH_MS = 2e3;
+var DEFAULT_TIMEOUT_MS = 5e3;
+var MAX_RETRY_ATTEMPTS = 3;
+var BASE_RETRY_DELAY_MS = 200;
+var Dispatcher = class {
+  constructor(opts) {
+    /** The in-memory buffer accumulating payloads between flushes. */
+    this.buffer = [];
+    /** The NodeJS/browser timer handle for the periodic flush. */
+    this.flushTimer = null;
+    /** Tracks all in-flight fetch Promises so flush() can await them. */
+    this.inFlight = /* @__PURE__ */ new Set();
+    var _a, _b, _c, _d;
+    this.ingestUrl = opts.ingestUrl;
+    this.apiKey = opts.apiKey;
+    this.timeoutMs = (_a = opts.timeoutMs) != null ? _a : DEFAULT_TIMEOUT_MS;
+    this.batchSize = (_b = opts.batchSize) != null ? _b : DEFAULT_BATCH_SIZE;
+    this.onError = (_c = opts.onError) != null ? _c : ((err, payloads) => {
+      console.warn(
+        `[PromptTracer] Failed to deliver ${payloads.length} trace(s):`,
+        err.message
+      );
+    });
+    const intervalMs = (_d = opts.flushIntervalMs) != null ? _d : DEFAULT_FLUSH_MS;
+    this.flushTimer = setInterval(() => {
+      if (this.buffer.length > 0) {
+        this._drainBuffer();
+      }
+    }, intervalMs);
+    if (typeof this.flushTimer === "object" && typeof this.flushTimer.unref === "function") {
+      this.flushTimer.unref();
+    }
+  }
+  // ── Public API ─────────────────────────────────────────────────────────────
+  /**
+   * Accepts a payload and schedules delivery non-blocking via the microtask
+   * queue. The caller returns immediately; the POST happens asynchronously.
+   */
+  send(payload) {
+    Promise.resolve().then(() => {
+      this.buffer.push(payload);
+      if (this.buffer.length >= this.batchSize) {
+        this._drainBuffer();
+      }
+    });
+  }
+  /**
+   * Waits for all in-flight requests and flushes any remaining buffered
+   * payloads. Call this in tests or on process shutdown.
+   *
+   * @example
+   * process.on('SIGTERM', () => tracer.flush());
+   */
+  async flush() {
+    if (this.buffer.length > 0) {
+      this._drainBuffer();
+    }
+    if (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
+    }
+  }
+  /**
+   * Stops the periodic flush timer and flushes remaining payloads.
+   * Call when the Tracer instance is being torn down.
+   */
+  async destroy() {
+    if (this.flushTimer !== null) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.flush();
+  }
+  // ── Private ────────────────────────────────────────────────────────────────
+  /**
+   * Atomically snapshots and clears the buffer, then initiates an async
+   * POST. Multiple concurrent drains are safe — each works on its own slice.
+   */
+  _drainBuffer() {
+    const batch = this.buffer.splice(0, this.buffer.length);
+    if (batch.length === 0) return;
+    const promise = this._sendWithRetry(batch, 1).finally(() => {
+      this.inFlight.delete(promise);
+    });
+    this.inFlight.add(promise);
+  }
+  /**
+   * Attempts to POST a batch to the ingest endpoint.
+   * Retries up to MAX_RETRY_ATTEMPTS times with exponential back-off.
+   * Only retries on network errors or 5xx responses.
+   */
+  async _sendWithRetry(batch, attempt) {
+    try {
+      await this._post(batch);
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      if (attempt < MAX_RETRY_ATTEMPTS) {
+        const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+        await sleep(delay);
+        return this._sendWithRetry(batch, attempt + 1);
+      }
+      this.onError(error, batch);
+    }
+  }
+  /**
+   * Performs the raw HTTP POST with an AbortController timeout.
+   * Throws on network failure or non-2xx status.
+   */
+  async _post(batch) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const headers = {
+      "Content-Type": "application/json"
+    };
+    if (this.apiKey) {
+      headers["x-api-key"] = this.apiKey;
+    }
+    let response;
+    try {
+      response = await fetch(this.ingestUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ traces: batch }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!response.ok) {
+      if (response.status >= 500) {
+        throw new Error(`Ingest endpoint returned ${response.status}`);
+      }
+      console.warn(
+        `[PromptTracer] Ingest rejected batch (${response.status}). Discarding ${batch.length} trace(s).`
+      );
+    }
+  }
+  // ── Helpers ──────────────────────────────────────────────────────────────────
+};
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// src/utils/cost.ts
+var MODEL_PRICES = {
+  // ── OpenAI ──────────────────────────────────────────────────────────────
+  "gpt-4o": { inputPer1M: 2.5, outputPer1M: 10 },
+  "gpt-4o-mini": { inputPer1M: 0.15, outputPer1M: 0.6 },
+  "gpt-4-turbo": { inputPer1M: 10, outputPer1M: 30 },
+  "gpt-4": { inputPer1M: 30, outputPer1M: 60 },
+  "gpt-3.5-turbo": { inputPer1M: 0.5, outputPer1M: 1.5 },
+  "o1": { inputPer1M: 15, outputPer1M: 60 },
+  "o1-mini": { inputPer1M: 3, outputPer1M: 12 },
+  "o3-mini": { inputPer1M: 1.1, outputPer1M: 4.4 },
+  // ── Anthropic ───────────────────────────────────────────────────────────
+  "claude-opus-4": { inputPer1M: 15, outputPer1M: 75 },
+  "claude-sonnet-4": { inputPer1M: 3, outputPer1M: 15 },
+  "claude-haiku-4": { inputPer1M: 0.8, outputPer1M: 4 },
+  "claude-3-5-sonnet": { inputPer1M: 3, outputPer1M: 15 },
+  "claude-3-5-haiku": { inputPer1M: 0.8, outputPer1M: 4 },
+  "claude-3-opus": { inputPer1M: 15, outputPer1M: 75 },
+  // ── Google ──────────────────────────────────────────────────────────────
+  "gemini-1.5-pro": { inputPer1M: 3.5, outputPer1M: 10.5 },
+  "gemini-1.5-flash": { inputPer1M: 0.35, outputPer1M: 1.05 },
+  "gemini-2.0-flash": { inputPer1M: 0.1, outputPer1M: 0.4 }
+};
+var UNKNOWN_PRICE = { inputPer1M: 0, outputPer1M: 0 };
+function resolvePrice(model) {
+  const normalised = model.toLowerCase().trim();
+  if (normalised in MODEL_PRICES) return MODEL_PRICES[normalised];
+  for (const key of Object.keys(MODEL_PRICES)) {
+    if (normalised.startsWith(key)) return MODEL_PRICES[key];
+  }
+  return UNKNOWN_PRICE;
+}
+function calcCostUsd({ model, tokensIn, tokensOut }) {
+  const price = resolvePrice(model);
+  const inputCost = tokensIn / 1e6 * price.inputPer1M;
+  const outputCost = tokensOut / 1e6 * price.outputPer1M;
+  return Math.round((inputCost + outputCost) * 1e8) / 1e8;
+}
+function formatCostUsd(usd) {
+  if (usd === 0) return "$0.00";
+  if (usd < 1e-4) return `$${usd.toFixed(8).replace(/0+$/, "")}`;
+  if (usd < 0.01) return `$${usd.toFixed(6).replace(/0+$/, "")}`;
+  return `$${usd.toFixed(4)}`;
+}
+
+// src/core/tracer.ts
+var SDK_VERSION = "0.1.0";
+function uuid() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    const v = c === "x" ? r : r & 3 | 8;
+    return v.toString(16);
+  });
+}
+var Tracer = class {
+  constructor(opts, dispatcher) {
+    /**
+     * Monotonically increasing step counter.
+     * Step 1 → first call in the session (triggers full snapshot in the DB).
+     * Step N → subsequent calls (store diff only).
+     */
+    this.stepCounter = 0;
+    var _a, _b, _c;
+    this.sessionId = (_a = opts.sessionId) != null ? _a : uuid();
+    this.metadata = (_b = opts.metadata) != null ? _b : {};
+    this.enabled = (_c = opts.enabled) != null ? _c : true;
+    this.dispatcher = dispatcher != null ? dispatcher : new Dispatcher({
+      ingestUrl: opts.ingestUrl,
+      apiKey: opts.apiKey,
+      timeoutMs: opts.timeoutMs,
+      onError: opts.onError ? (err, payloads) => payloads.forEach((p) => opts.onError(err, p)) : void 0
+    });
+  }
+  // ── Public API ──────────────────────────────────────────────────────────────
+  /**
+   * The method called by every SDK wrapper after intercepting an LLM call.
+   *
+   * Design contract:
+   *   - NEVER awaited by the wrapper; fire-and-forget on microtask queue.
+   *   - Returns void so the wrapper cannot accidentally `await` it.
+   *
+   * @example
+   * // Inside wrappers/openai.ts — after receiving the result:
+   * tracer.captureAsync({ prompt, response, model, tokensIn, tokensOut, latencyMs, isStream });
+   */
+  captureAsync(raw) {
+    if (!this.enabled) return;
+    Promise.resolve().then(() => {
+      try {
+        const payload = this._enrich(raw);
+        this.dispatcher.send(payload);
+      } catch (err) {
+        console.warn("[PromptTracer] Failed to enrich payload:", err);
+      }
+    });
+  }
+  /**
+   * Returns the step index the *next* call will be assigned.
+   * Useful for callers who need to know if this is step 1 (full snapshot)
+   * vs. a later step (diff only) before making the LLM call.
+   */
+  get nextStepIndex() {
+    return this.stepCounter + 1;
+  }
+  /**
+   * Waits for all buffered and in-flight payloads to be delivered.
+   * Call before process exit or at the end of integration tests.
+   *
+   * @example
+   * afterAll(async () => { await tracer.flush(); });
+   */
+  async flush() {
+    await this.dispatcher.flush();
+  }
+  // ── Private ─────────────────────────────────────────────────────────────────
+  /**
+   * Takes a raw capture from the wrapper and enriches it with:
+   *   - a unique callId
+   *   - the session's sessionId
+   *   - a monotonic stepIndex
+   *   - ISO-8601 timestamp
+   *   - USD cost estimate
+   *   - SDK version string
+   *   - caller metadata
+   */
+  _enrich(raw) {
+    var _a, _b;
+    this.stepCounter += 1;
+    const estimatedCostUsd = calcCostUsd({
+      model: raw.model,
+      tokensIn: (_a = raw.tokensIn) != null ? _a : 0,
+      tokensOut: (_b = raw.tokensOut) != null ? _b : 0
+    });
+    return __spreadValues(__spreadProps(__spreadValues({
+      // ── Core identity ───────────────────────────────────────────────────
+      callId: uuid(),
+      sessionId: this.sessionId,
+      stepIndex: this.stepCounter,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString()
+    }, raw), {
+      // ── Enrichment ───────────────────────────────────────────────────────
+      estimatedCostUsd,
+      sdkVersion: SDK_VERSION
+    }), Object.keys(this.metadata).length > 0 ? { metadata: this.metadata } : {});
+  }
+};
+
+// src/wrappers/openai.ts
+function wrapOpenAI(client, tracer) {
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      if (prop === "chat") {
+        return new Proxy(target.chat, {
+          get(chatTarget, chatProp, chatReceiver) {
+            if (chatProp === "completions") {
+              return new Proxy(chatTarget.completions, {
+                get(compTarget, compProp, compReceiver) {
+                  if (compProp === "create") {
+                    return _makeCreateInterceptor(compTarget, tracer);
+                  }
+                  return Reflect.get(compTarget, compProp, compReceiver);
+                }
+              });
+            }
+            return Reflect.get(chatTarget, chatProp, chatReceiver);
+          }
+        });
+      }
+      return Reflect.get(target, prop, receiver);
+    }
+  });
+}
+function _makeCreateInterceptor(compTarget, tracer) {
+  async function create(params) {
+    var _a, _b, _c, _d, _e;
+    const startMs = Date.now();
+    if (params.stream === true) {
+      const stream = await compTarget.create(params);
+      return _wrapStream(stream, params, startMs, tracer);
+    }
+    const result = await compTarget.create(params);
+    const latencyMs = Date.now() - startMs;
+    tracer.captureAsync({
+      prompt: params.messages,
+      response: (_c = (_b = (_a = result.choices[0]) == null ? void 0 : _a.message) == null ? void 0 : _b.content) != null ? _c : "",
+      model: params.model,
+      tokensIn: (_d = result.usage) == null ? void 0 : _d.prompt_tokens,
+      tokensOut: (_e = result.usage) == null ? void 0 : _e.completion_tokens,
+      latencyMs,
+      isStream: false
+    });
+    return result;
+  }
+  return create;
+}
+function _wrapStream(stream, params, startMs, tracer) {
+  return __asyncGenerator(this, null, function* () {
+    var _a, _b, _c, _d;
+    let fullContent = "";
+    let chunkCount = 0;
+    let promptTokens;
+    try {
+      try {
+        for (var iter = __forAwait(stream), more, temp, error; more = !(temp = yield new __await(iter.next())).done; more = false) {
+          const chunk = temp.value;
+          if (((_a = chunk.usage) == null ? void 0 : _a.prompt_tokens) !== void 0) {
+            promptTokens = chunk.usage.prompt_tokens;
+          }
+          const delta = (_d = (_c = (_b = chunk.choices[0]) == null ? void 0 : _b.delta) == null ? void 0 : _c.content) != null ? _d : "";
+          fullContent += delta;
+          chunkCount += 1;
+          yield chunk;
+        }
+      } catch (temp) {
+        error = [temp];
+      } finally {
+        try {
+          more && (temp = iter.return) && (yield new __await(temp.call(iter)));
+        } finally {
+          if (error)
+            throw error[0];
+        }
+      }
+    } finally {
+      const latencyMs = Date.now() - startMs;
+      tracer.captureAsync({
+        prompt: params.messages,
+        response: fullContent,
+        model: params.model,
+        tokensIn: promptTokens,
+        // exact if include_usage was set
+        tokensOut: chunkCount,
+        // approximation: 1 chunk ≈ 1 token
+        latencyMs,
+        isStream: true
+      });
+    }
+  });
+}
+export {
+  Dispatcher,
+  Tracer,
+  calcCostUsd,
+  formatCostUsd,
+  wrapOpenAI
+};

@@ -3,16 +3,11 @@
 // Drains the Redis ingest queue into Supabase in atomic batches.
 // Invoked by Vercel Cron — protected by CRON_SECRET.
 //
-// Two-table write per batch:
-//   llm_calls        — one row per trace (cost, tokens, latency, model)
-//   prompt_snapshots — diff-only storage:
-//                      step 1  → full_snapshot
-//                      step N  → diff_from_previous (computed here)
-//
-// Diff lookup order:
-//   1. In-memory cache (same batch — zero DB round-trips)
-//   2. prompt_snapshots table (previous batch)
-//   3. Graceful fallback: store full snapshot if prev not found
+// v2 change: every row now includes project_id, read from the payload.
+// The ingest endpoint injects project_id at queue time after validating
+// the API key, so drain-queue trusts it unconditionally.
+// Traces with no project_id are skipped and logged — they are orphaned
+// v1 payloads that arrived before the migration.
 
 import { Redis }              from "@upstash/redis";
 import { supabaseAdmin }      from "@/lib/supabase";
@@ -37,27 +32,12 @@ const redis = new Redis({
 });
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-//
-// FIX 1: Removed cross-package import:
-//   import type { TracePayload, ChatMessage } from "@/packages/sdk/src/core/types"
-//
-// Root cause: The SDK uses "type": "module" (ESM) but Next.js compiles
-// server routes as CJS by default. Importing across the boundary causes
-// the "module format mismatch" error we fixed earlier.
-//
-// Fix: Define the types we actually need locally. They mirror the SDK
-// exactly — if you change the SDK's TracePayload, update this too.
 
 export interface ChatMessage {
-  role:     "system" | "user" | "assistant" | "tool" | "function";
-  content:  string | null;
-  name?:    string;
+  role:    "system" | "user" | "assistant" | "tool" | "function";
+  content: string | null;
+  name?:   string;
 }
-
-// FIX 2: TracePayload.metadata was missing from the SDK's interface.
-// The SDK's tracer.ts spreads metadata onto the payload but the interface
-// never declared it, so TypeScript didn't know it existed.
-// We define it explicitly here so the drain-queue can read it safely.
 
 export interface TracePayload {
   callId:           string;
@@ -73,11 +53,10 @@ export interface TracePayload {
   isStream:         boolean;
   estimatedCostUsd: number;
   sdkVersion:       string;
-  // explicitly typed — was missing from SDK interface
   metadata?:        Record<string, unknown>;
+  // Injected by the ingest endpoint after API key validation
+  projectId?:       string;
 }
-
-// DB row shapes
 
 interface LlmCallRow {
   call_id:            string;
@@ -93,6 +72,7 @@ interface LlmCallRow {
   sdk_version:        string | null;
   metadata:           Record<string, unknown> | null;
   timestamp:          string;
+  project_id:         string;
 }
 
 interface SnapshotRow {
@@ -101,13 +81,12 @@ interface SnapshotRow {
   step_index:         number;
   full_snapshot:      ChatMessage[] | null;
   diff_from_previous: ReturnType<typeof computeMessageDiff> | null;
+  project_id:         string;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function parseEntry(raw: unknown): TracePayload | null {
-  // FIX 3: Upstash lpop may return already-parsed objects or raw JSON strings
-  // depending on SDK version and how the payload was pushed. Handle both.
   if (raw !== null && typeof raw === "object") return raw as TracePayload;
   if (typeof raw === "string") {
     try {
@@ -120,7 +99,7 @@ function parseEntry(raw: unknown): TracePayload | null {
   return null;
 }
 
-function toLlmCallRow(t: TracePayload): LlmCallRow {
+function toLlmCallRow(t: TracePayload, projectId: string): LlmCallRow {
   const tokensIn  = t.tokensIn  ?? null;
   const tokensOut = t.tokensOut ?? null;
 
@@ -132,21 +111,17 @@ function toLlmCallRow(t: TracePayload): LlmCallRow {
     tokens_in:          tokensIn,
     tokens_out:         tokensOut,
     latency_ms:         t.latencyMs,
-    // Recalculate cost server-side — single source of truth
-    // Overrides whatever the SDK sent, uses our MODEL_PRICES table
     estimated_cost_usd: calcCostUsd({
-      model:     t.model,
+      model:    t.model,
       tokensIn:  tokensIn  ?? 0,
       tokensOut: tokensOut ?? 0,
     }),
     is_stream:          t.isStream,
-    response:           t.response   ?? null,
+    response:           t.response  ?? null,
     sdk_version:        t.sdkVersion ?? null,
-    // FIX 4: t.metadata was previously typed as never because TracePayload
-    // didn't declare it. Now that we've added metadata? to our local
-    // TracePayload type above, this compiles correctly.
-    metadata:           t.metadata   ?? null,
+    metadata:           t.metadata  ?? null,
     timestamp:          t.timestamp,
+    project_id:         projectId,
   };
 }
 
@@ -159,40 +134,44 @@ export async function GET(req: Request) {
     return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
 
-  // ── 1. Atomic batch pop ──────────────────────────────────────────────────
-  // FIX 5: Original code used lrange + ltrim which has a race condition —
-  // if two cron ticks overlap, both read the same items before either trims.
-  //
-  // lpop with count is a single atomic command with no race window.
-  //
-  // Upstash type: lpop<T>(key, count) → Promise<T[] | null>
-  // The generic T is the element type, not the array type.
+  // ── 1. Atomic batch pop ───────────────────────────────────────────────────
   const rawBatch = await redis.lpop<unknown>(QUEUE_KEY, BATCH_SIZE);
 
-  // FIX 6: Upstash returns null (not an empty array) when the queue is empty,
-  // and returns a single item (not an array) when count=1 with one item.
-  // Normalise both edge cases.
   if (!rawBatch) {
     return Response.json({ ok: true, processed: 0, message: "Queue empty" });
   }
 
   const rawArray: unknown[] = Array.isArray(rawBatch) ? rawBatch : [rawBatch];
 
-  // ── 2. Parse — skip corrupted entries, continue with the rest ────────────
-  const traces = rawArray
+  // ── 2. Parse and validate ─────────────────────────────────────────────────
+  const allTraces = rawArray
     .map((raw) => parseEntry(raw))
     .filter((t): t is TracePayload => t !== null);
+
+  // ── 3. Filter out orphaned v1 traces (no project_id) ─────────────────────
+  const orphaned = allTraces.filter((t) => !t.projectId);
+  if (orphaned.length > 0) {
+    console.warn(
+      `[drain-queue] Skipping ${orphaned.length} orphaned trace(s) with no project_id.`
+    );
+  }
+
+  const traces = allTraces.filter((t): t is TracePayload & { projectId: string } =>
+    typeof t.projectId === "string" && t.projectId.length > 0
+  );
 
   if (traces.length === 0) {
     return Response.json({
       ok:        true,
       processed: 0,
-      message:   "All entries in batch were unparseable — skipped.",
+      message:   "No valid project-scoped traces in batch.",
     });
   }
 
-  // ── 3. Insert into llm_calls ─────────────────────────────────────────────
-  const llmCallRows: LlmCallRow[] = traces.map(toLlmCallRow);
+  // ── 4. Insert into llm_calls ──────────────────────────────────────────────
+  const llmCallRows: LlmCallRow[] = traces.map((t) =>
+    toLlmCallRow(t, t.projectId)
+  );
 
   const { error: llmError } = await supabaseAdmin
     .from("llm_calls")
@@ -203,27 +182,27 @@ export async function GET(req: Request) {
     return Response.json({ ok: false, error: llmError.message }, { status: 500 });
   }
 
-  // ── 4. Build in-memory prompt cache for within-batch diff ────────────────
+  // ── 5. Build prompt cache for within-batch diffs ──────────────────────────
   const promptCache = new Map<string, ChatMessage[]>();
   for (const trace of traces) {
     promptCache.set(
       `${trace.sessionId}:${trace.stepIndex}`,
-      // FIX 7: trace.prompt is readonly ChatMessage[] — spread it to get a
-      // mutable copy so downstream code can safely mutate if needed.
       [...trace.prompt] as ChatMessage[],
     );
   }
 
-  // ── 5. Sort by session + step ─────────────────────────────────────────────
+  // ── 6. Sort by session + step for correct diff ordering ───────────────────
   const sorted = [...traces].sort(
     (a, b) =>
       a.sessionId.localeCompare(b.sessionId) || a.stepIndex - b.stepIndex,
   );
 
-  // ── 6. Build snapshot rows with diff-only logic ───────────────────────────
+  // ── 7. Build snapshot rows with diff-only logic ───────────────────────────
   const snapshotRows: SnapshotRow[] = [];
 
   for (const trace of sorted) {
+    const projectId = trace.projectId;
+
     if (trace.stepIndex === 1) {
       snapshotRows.push({
         call_id:            trace.callId,
@@ -231,6 +210,7 @@ export async function GET(req: Request) {
         step_index:         trace.stepIndex,
         full_snapshot:      [...trace.prompt] as ChatMessage[],
         diff_from_previous: null,
+        project_id:         projectId,
       });
       continue;
     }
@@ -244,6 +224,7 @@ export async function GET(req: Request) {
         .select("full_snapshot")
         .eq("session_id", trace.sessionId)
         .eq("step_index", trace.stepIndex - 1)
+        .eq("project_id", projectId)
         .single();
 
       if (data?.full_snapshot) {
@@ -261,12 +242,13 @@ export async function GET(req: Request) {
           prevMessages,
           [...trace.prompt] as ChatMessage[],
         ),
+        project_id:         projectId,
       });
     } else {
       console.warn(
         `[drain-queue] prev snapshot not found — ` +
         `session=${trace.sessionId} step=${trace.stepIndex - 1}. ` +
-        `Storing full snapshot as fallback.`,
+        `Storing full snapshot as fallback.`
       );
       snapshotRows.push({
         call_id:            trace.callId,
@@ -274,11 +256,12 @@ export async function GET(req: Request) {
         step_index:         trace.stepIndex,
         full_snapshot:      [...trace.prompt] as ChatMessage[],
         diff_from_previous: null,
+        project_id:         projectId,
       });
     }
   }
 
-  // ── 7. Bulk insert snapshot rows ──────────────────────────────────────────
+  // ── 8. Bulk insert snapshot rows ──────────────────────────────────────────
   if (snapshotRows.length > 0) {
     const { error: snapError } = await supabaseAdmin
       .from("prompt_snapshots")
@@ -286,9 +269,6 @@ export async function GET(req: Request) {
 
     if (snapError) {
       console.error("[drain-queue] prompt_snapshots insert failed:", snapError.message);
-      // llm_calls rows already committed.
-      // Dashboard degrades gracefully — session detail works,
-      // diff viewer shows empty state.
       return Response.json({ ok: false, error: snapError.message }, { status: 500 });
     }
   }

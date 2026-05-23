@@ -17,17 +17,6 @@ const supabaseAdmin = createClient(
 
 // ── Type Definitions ──────────────────────────────────────────────────────────
 
-export interface LlmCallBase {
-  session_id: string;
-  model: string;
-  tokens_in: number | null;
-  tokens_out: number | null;
-  estimated_cost_usd: number | null;
-  latency_ms: number;
-  timestamp: string;
-  metadata?: Record<string, unknown> | null;
-}
-
 export interface GlobalKPIs {
   totalCost: string;
   totalTokens: string;
@@ -290,33 +279,4 @@ export async function getRecentActivity(
   }
 
   return data ?? [];
-}
-
-// ── 7. Utility: Safe Query Wrapper ───────────────────────────────────────────
-
-/**
- * Generic wrapper for safe query execution with logging.
- * Use this for custom queries that need project scoping.
- * 
- * @example
- * const sessions = await safeQuery(
- *   "custom_query",
- *   supabaseAdmin
- *     .from("llm_calls")
- *     .select("session_id")
- *     .eq("project_id", projectId)
- * );
- */
-export async function safeQuery<T>(
-  queryName: string,
-  query: Promise<{ data: T | null; error: Error | null }>
-): Promise<T | null> {
-  const { data, error } = await query;
-
-  if (error) {
-    console.error(`[${queryName}] Query failed:`, error instanceof Error ? error.message : error);
-    return null;
-  }
-
-  return data;
 }

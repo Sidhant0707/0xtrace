@@ -236,18 +236,6 @@ export default async function SessionsPage({ searchParams }: PageProps) {
             7 days
           </p>
         </div>
-        <button
-          type="button"
-          className={[
-            "h-9 px-3 border border-[#333] bg-transparent",
-            "text-[#e4e4e7] text-sm rounded-md",
-            "inline-flex items-center gap-2",
-            "transition-colors duration-[120ms] ease-in-out",
-            "hover:border-[#555] active:scale-[0.98]",
-          ].join(" ")}
-        >
-          + New Session
-        </button>
       </div>
 
       {/* ── Metric strip ── */}

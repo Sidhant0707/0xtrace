@@ -1,174 +1,245 @@
+// app/dashboard/settings/page.tsx
+
 import type { Metadata } from "next";
-import { cookies } from "next/headers";
-import { createServerClient } from "@supabase/ssr";
+import Image from "next/image";
 import { redirect } from "next/navigation";
+import { createClient } from "@/lib/supabase-server";
+import { supabaseAdmin } from "@/lib/supabase";
+import { getActiveProject } from "@/lib/project-context";
+import { KeyManager } from "./KeyManager";
+import { DeleteProjectButton } from "./DeleteProjectButton";
+import type { ApiKeyRow } from "./KeyManager";
 
-export const metadata: Metadata = {
-  title: "Settings",
-};
+export const metadata: Metadata = { title: "Settings" };
 
-export default async function SettingsPage() {
-  const cookieStore = await cookies();
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return cookieStore.getAll();
-        },
-        setAll() {},
-      },
-    }
-  );
+// ── Data fetching ─────────────────────────────────────────────────────────────
 
-  const { data: { user } } = await supabase.auth.getUser();
+async function getApiKeys(projectId: string): Promise<ApiKeyRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from("api_keys")
+    .select("id, name, key_prefix, is_active, last_used_at, created_at")
+    .eq("project_id", projectId)
+    .order("created_at", { ascending: false });
 
-  if (!user) {
-    redirect("/login");
+  if (error) {
+    console.error("[settings] keys fetch failed:", error.message);
+    return [];
   }
 
-  // Extract GitHub OAuth metadata safely
-  const avatarUrl = user.user_metadata?.avatar_url || "";
-  const fullName = user.user_metadata?.full_name || user.email || "Developer";
-  const preferredName = user.user_metadata?.preferred_username || "github-user";
+  return (data ?? []) as ApiKeyRow[];
+}
+
+// ── Section wrapper ───────────────────────────────────────────────────────────
+
+function Section({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
+      <div className="px-6 py-5 border-b border-[#1f1f1f] bg-[#0a0a0a]">
+        <h2 className="m-0 text-white text-[14px] font-medium">{title}</h2>
+        {description && (
+          <p className="mt-1 mb-0 text-[#71717a] text-[12px]">{description}</p>
+        )}
+      </div>
+      <div className="px-6 py-5">{children}</div>
+    </section>
+  );
+}
+
+// ── Page ──────────────────────────────────────────────────────────────────────
+
+export default async function SettingsPage() {
+  // ── Auth ───────────────────────────────────────────────────────────────────
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  const activeProject = await getActiveProject();
+  if (!activeProject) redirect("/onboarding");
+
+  const keys = await getApiKeys(activeProject.id);
+
+  // ── Profile data from GitHub OAuth metadata ────────────────────────────────
+  const avatarUrl =
+    (user.user_metadata?.avatar_url as string | undefined) ?? "";
+  const fullName =
+    (user.user_metadata?.full_name as string | undefined) ??
+    user.email ??
+    "Developer";
+  const githubLogin =
+    (user.user_metadata?.preferred_username as string | undefined) ?? "";
+
+  // ── Ingest URL — derived from env so it resolves correctly on every deployment
+  const ingestUrl = `${process.env.NEXT_PUBLIC_APP_URL ?? ""}/api/ingest`;
 
   return (
     <div>
+      {/* ── Page header ── */}
       <div className="mb-8">
         <h1 className="m-0 text-white text-2xl font-medium leading-tight tracking-[-0.02em]">
           Settings
         </h1>
         <p className="mt-1.5 text-[#71717a] text-sm m-0">
-          Manage your account, SDK configuration, and data retention.
+          {activeProject.name} · API keys, integration config, and project
+          management
         </p>
       </div>
 
-      <div className="grid gap-8" style={{ gridTemplateColumns: "minmax(0, 1fr) 340px" }}>
-        
-        {/* ── LEFT COLUMN: Configs ── */}
+      {/* grid-cols Tailwind arbitrary value replaces the inline style */}
+      <div className="grid grid-cols-[minmax(0,1fr)_300px] gap-6">
+        {/* ── LEFT column ── */}
         <div className="flex flex-col gap-6">
-          
           {/* SDK Integration */}
-          <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
-            <div className="px-5 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a]">
-              <h2 className="m-0 text-white text-sm font-medium">SDK Integration</h2>
+          <Section
+            title="SDK Integration"
+            description="Use these values to configure the 0xtrace SDK in your application."
+          >
+            <div className="space-y-4">
+              {/* Ingest URL — readOnly input so the user can click-select and copy */}
+              <div>
+                <label
+                  htmlFor="ingest-url"
+                  className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-1.5"
+                >
+                  Ingest URL
+                </label>
+                <input
+                  id="ingest-url"
+                  type="text"
+                  readOnly
+                  value={ingestUrl}
+                  className="w-full h-9 bg-[#0a0a0a] border border-[#262626] rounded-lg px-3 font-mono text-[12px] text-[#a1a1aa] outline-none cursor-text select-all"
+                />
+              </div>
+
+              {/* SDK snippet */}
+              <div className="p-4 bg-[#0a0a0a] border border-[#1f1f1f] rounded-lg font-mono text-[12px] leading-[1.8]">
+                <span className="text-[#71717a]">const </span>
+                <span className="text-[#60a5fa]">tracer</span>
+                <span className="text-[#71717a]"> = new </span>
+                <span className="text-[#e4e4e7]">Tracer</span>
+                <span className="text-[#71717a]">{"({"}</span>
+                <br />
+                <span className="text-[#71717a]">{"  "}ingestUrl: </span>
+                <span className="text-[#a1a1aa]">process.env.INGEST_URL</span>
+                <span className="text-[#71717a]">,</span>
+                <br />
+                <span className="text-[#71717a]">{"  "}apiKey: </span>
+                <span className="text-[#a1a1aa]">
+                  process.env.INGEST_API_KEY
+                </span>
+                <span className="text-[#71717a]">,</span>
+                <br />
+                <span className="text-[#71717a]">{"});"}</span>
+              </div>
             </div>
-            <div className="p-5">
-              <p className="text-[#71717a] text-[13px] mb-4">
-                Initialize the `Tracer` in your application using these credentials. 
-                Keep your API key secure and do not commit it to version control.
+          </Section>
+
+          {/* API Keys */}
+          <Section
+            title="API Keys"
+            description="Keys authenticate your SDK with the ingest endpoint. Revoked keys are rejected immediately."
+          >
+            <KeyManager initialKeys={keys} />
+          </Section>
+
+          {/* Danger zone — intentionally not using Section to keep its red border distinct */}
+          <section className="bg-[#111] border border-[#f43f5e]/20 rounded-lg overflow-hidden">
+            <div className="px-6 py-5 border-b border-[#f43f5e]/10 bg-[#0a0a0a]">
+              <h2 className="m-0 text-[#f43f5e] text-[14px] font-medium">
+                Danger Zone
+              </h2>
+              <p className="mt-1 mb-0 text-[#71717a] text-[12px]">
+                Destructive actions that cannot be undone.
               </p>
-              
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-wider mb-1.5">
-                    Ingest URL
-                  </label>
-                  <div className="flex">
-                    <input 
-                      readOnly 
-                      value="https://api.0xtrace.dev/v1/ingest" 
-                      className="w-full bg-[#080808] border border-[#262626] rounded-l-md px-3 h-9 text-[13px] text-[#e4e4e7] font-mono outline-none focus:border-[#3b82f6]"
-                    />
-                    <button className="h-9 px-4 bg-[#1a1a1a] border border-l-0 border-[#262626] rounded-r-md text-[#a1a1aa] text-[12px] hover:bg-[#262626] hover:text-white transition-colors">
-                      Copy
-                    </button>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-wider mb-1.5">
-                    Ingest API Key
-                  </label>
-                  <div className="flex">
-                    <input 
-                      type="password"
-                      readOnly 
-                      value="trc_live_9a8b7c6d5e4f3g2h1i0j" 
-                      className="w-full bg-[#080808] border border-[#262626] rounded-l-md px-3 h-9 text-[13px] text-[#e4e4e7] font-mono outline-none focus:border-[#3b82f6]"
-                    />
-                    <button className="h-9 px-4 bg-[#1a1a1a] border border-l-0 border-[#262626] rounded-r-md text-[#a1a1aa] text-[12px] hover:bg-[#262626] hover:text-white transition-colors">
-                      Copy
-                    </button>
-                  </div>
-                </div>
-              </div>
             </div>
-          </section>
-
-          {/* Data Retention */}
-          <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
-            <div className="px-5 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a]">
-              <h2 className="m-0 text-white text-sm font-medium">Data Management</h2>
-            </div>
-            <div className="p-5 flex items-center justify-between">
+            <div className="px-6 py-5 flex items-center justify-between gap-6 flex-wrap">
               <div>
-                <div className="text-[#e4e4e7] text-[13px] font-medium">Auto-Prune Context Arrays</div>
-                <div className="text-[#71717a] text-[12px] mt-1">
-                  Massive JSONB messages arrays older than 7 days are automatically dropped to save Postgres space. Metadata and token counts are retained forever.
-                </div>
+                <p className="m-0 text-[#e4e4e7] text-[13px] font-medium">
+                  Delete &ldquo;{activeProject.name}&rdquo;
+                </p>
+                <p className="mt-1 mb-0 text-[#71717a] text-[12px]">
+                  Permanently removes this project, all API keys, all traces,
+                  and all snapshots.
+                </p>
               </div>
-              <span className="h-6 px-2.5 bg-[#052e16] border border-[#064e3b] text-[#10b981] text-[11px] rounded inline-flex items-center">
-                Active
-              </span>
-            </div>
-            <div className="p-5 border-t border-[#1f1f1f] flex items-center justify-between bg-[#161111]">
-              <div>
-                <div className="text-[#f43f5e] text-[13px] font-medium">Danger Zone</div>
-                <div className="text-[#a1a1aa] text-[12px] mt-1">
-                  Permanently delete all ingested traces and anomalies from this project.
-                </div>
-              </div>
-              <button className="h-8 px-4 bg-[#1f0a0a] border border-[#4a1111] rounded text-[#f43f5e] text-[12px] hover:bg-[#2a0e0e] transition-colors">
-                Flush Database
-              </button>
+              <DeleteProjectButton projectName={activeProject.name} />
             </div>
           </section>
         </div>
 
-        {/* ── RIGHT COLUMN: Profile ── */}
-        <aside className="flex flex-col gap-6">
-          <div className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden p-6 flex flex-col items-center text-center">
+        {/* ── RIGHT column: Account card ── */}
+        <aside className="h-fit bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
+          <div className="px-5 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a]">
+            <h2 className="m-0 text-white text-[14px] font-medium">Account</h2>
+          </div>
+
+          <div className="p-6 flex flex-col items-center text-center">
+            {/* Avatar — next/image replaces <img>. Domain must be in next.config.ts:
+                images: { remotePatterns: [{ hostname: "avatars.githubusercontent.com" }] } */}
             {avatarUrl ? (
-              <img 
-                src={avatarUrl} 
-                alt="GitHub Avatar" 
-                className="w-20 h-20 rounded-full border-2 border-[#262626] mb-4"
+              <Image
+                src={avatarUrl}
+                alt={`${fullName} avatar`}
+                width={64}
+                height={64}
+                className="rounded-full border-2 border-[#262626] mb-4"
               />
             ) : (
-              <div className="w-20 h-20 rounded-full bg-[#1a1a1a] border-2 border-[#262626] mb-4 flex items-center justify-center text-[#71717a] text-xl font-mono">
-                {preferredName.substring(0, 2).toUpperCase()}
+              <div className="w-16 h-16 rounded-full bg-[#1a1a1a] border-2 border-[#262626] mb-4 flex items-center justify-center text-[#71717a] text-lg font-mono">
+                {fullName.slice(0, 2).toUpperCase()}
               </div>
             )}
-            
-            <h3 className="text-white font-medium m-0">{fullName}</h3>
-            <p className="text-[#71717a] text-[13px] font-mono mt-1">@{preferredName}</p>
-            
+
+            <h3 className="m-0 text-white text-[14px] font-medium">
+              {fullName}
+            </h3>
+            {githubLogin && (
+              <p className="mt-1 mb-0 text-[#71717a] text-[12px] font-mono">
+                @{githubLogin}
+              </p>
+            )}
+
             <div className="w-full h-px bg-[#1f1f1f] my-5" />
-            
-            <div className="w-full flex justify-between items-center text-[13px] mb-2">
-              <span className="text-[#71717a]">Provider</span>
-              <span className="text-[#e4e4e7] flex items-center gap-1.5">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z" />
-                </svg>
-                GitHub
-              </span>
+
+            <div className="w-full space-y-2 text-[12px]">
+              <div className="flex justify-between">
+                <span className="text-[#71717a]">Auth provider</span>
+                <span className="text-[#a1a1aa] flex items-center gap-1.5">
+                  <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="currentColor"
+                    aria-hidden="true"
+                  >
+                    <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z" />
+                  </svg>
+                  GitHub
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[#71717a]">Active project</span>
+                <span className="text-[#10b981]">{activeProject.name}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[#71717a]">API keys</span>
+                <span className="text-[#a1a1aa]">
+                  {keys.filter((k) => k.is_active).length} active
+                </span>
+              </div>
             </div>
-            <div className="w-full flex justify-between items-center text-[13px]">
-              <span className="text-[#71717a]">Role</span>
-              <span className="text-[#10b981] font-mono">Admin</span>
-            </div>
-            
-            <form action="/auth/signout" method="post" className="w-full mt-6">
-              <button className="w-full h-9 bg-transparent border border-[#333] text-[#a1a1aa] rounded-md text-[13px] hover:text-white hover:border-[#555] transition-colors">
-                Sign Out
-              </button>
-            </form>
           </div>
         </aside>
-
       </div>
     </div>
   );

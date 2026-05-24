@@ -22,9 +22,9 @@ function StatBlock({
 }: StatBlockProps) {
   return (
     <FadeIn delay={delay} direction="up">
-      <div className="py-10 border-b border-white/[0.04] last:border-0">
+      <div className="py-8 sm:py-10 border-b border-white/[0.04] last:border-0">
         <div
-          className={`font-mono text-[52px] font-semibold leading-none ${opacity}`}
+          className={`font-mono text-[40px] sm:text-[52px] font-semibold leading-none ${opacity}`}
         >
           {number}
         </div>
@@ -47,15 +47,19 @@ export function ProblemSection() {
   const inView = useInView(ref, { once: true, margin: "-100px" });
 
   return (
-    <section className="relative py-[120px] px-6 overflow-hidden" ref={ref}>
+    <section
+      className="relative py-16 sm:py-[120px] px-4 sm:px-6 overflow-hidden"
+      ref={ref}
+    >
+      {/* Watermark — hidden on mobile to prevent layout issues */}
       <motion.div
         initial={{ opacity: 0 }}
         animate={inView ? { opacity: 1 } : { opacity: 0 }}
         transition={{ duration: 1.2, delay: 0.2 }}
         aria-hidden="true"
-        className="pointer-events-none absolute right-[-4%] top-1/2 -translate-y-1/2 font-mono font-semibold text-[#0f0f0f]"
+        className="pointer-events-none absolute right-[-4%] top-1/2 -translate-y-1/2 font-mono font-semibold text-[#0f0f0f] hidden sm:block"
         style={{
-          fontSize: "clamp(120px, 18vw, 240px)",
+          fontSize: "clamp(80px, 14vw, 240px)",
           lineHeight: 1,
           userSelect: "none",
         }}
@@ -63,24 +67,24 @@ export function ProblemSection() {
         39×
       </motion.div>
 
-      <div className="relative z-10 max-w-[1120px] mx-auto grid grid-cols-1 md:grid-cols-2 gap-16 items-start">
+      <div className="relative z-10 max-w-[1120px] mx-auto grid grid-cols-1 md:grid-cols-2 gap-10 sm:gap-16 items-start">
         <FadeIn direction="left">
           <div>
             <p className="m-0 font-mono text-[12px] text-[#60a5fa] uppercase tracking-[3px]">
               The Problem
             </p>
-            <h2 className="m-0 mt-4 text-[clamp(30px,3.5vw,44px)] font-semibold text-white leading-[1.1] tracking-[-0.03em]">
+            <h2 className="m-0 mt-4 text-[clamp(26px,3.5vw,44px)] font-semibold text-white leading-[1.1] tracking-[-0.03em]">
               Your agent doesn&apos;t
               <br />
               know it&apos;s bleeding.
             </h2>
-            <p className="mt-5 mb-0 text-[16px] text-[#a1a1aa] leading-[1.8] max-w-[380px]">
+            <p className="mt-5 mb-0 text-[15px] sm:text-[16px] text-[#a1a1aa] leading-[1.8] max-w-[380px]">
               Every step in a multi-step agent re-sends the entire conversation
               history. By step 10, you&apos;re paying 39× what you paid on step
               1. No alert fires. No log appears.
             </p>
 
-            <div className="mt-10">
+            <div className="mt-8 sm:mt-10">
               <div className="font-mono text-[11px] text-[#60a5fa] uppercase tracking-[2px] mb-3">
                 Token accumulation · 10 steps
               </div>

@@ -2,25 +2,25 @@ import Link from "next/link";
 
 export function CTABanner() {
   return (
-    <section className="py-[120px] px-6">
+    <section className="py-16 sm:py-[120px] px-4 sm:px-6">
       <div className="max-w-[1100px] mx-auto text-center">
-        <h2 className="m-0 text-[clamp(36px,5vw,56px)] font-semibold text-white leading-[1.05] tracking-[-0.04em]">
+        <h2 className="m-0 text-[clamp(30px,5vw,56px)] font-semibold text-white leading-[1.05] tracking-[-0.04em]">
           Start tracing
           <br />
           in 5 minutes.
         </h2>
-        <p className="mt-4 mb-0 text-[16px] text-[#52525b]">
+        <p className="mt-4 mb-0 text-[15px] sm:text-[16px] text-[#52525b]">
           Free. Open source. No credit card required.
         </p>
 
-        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 mt-8">
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-center gap-3 mt-8">
           <Link
             href="/login"
             className={[
               "h-11 px-6 rounded-lg no-underline",
               "bg-white text-[#0a0a0a]",
               "text-[14px] font-semibold",
-              "inline-flex items-center",
+              "inline-flex items-center justify-center",
               "hover:bg-[#e5e5e5] active:scale-[0.98]",
               "transition-all duration-150",
             ].join(" ")}
@@ -35,7 +35,7 @@ export function CTABanner() {
               "h-11 px-6 rounded-lg no-underline",
               "border border-[#1f1f1f]",
               "text-[14px] text-[#a1a1aa]",
-              "inline-flex items-center gap-2",
+              "inline-flex items-center justify-center gap-2",
               "hover:border-[#3f3f46] hover:text-white",
               "transition-all duration-150",
             ].join(" ")}

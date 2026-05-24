@@ -1,16 +1,20 @@
 export function SocialProofBar() {
+  const items = [
+    { icon: "★", iconColor: "text-[#10b981]", label: "Open source" },
+    { label: "MIT licensed" },
+    { label: "Self-hostable" },
+    { label: "TypeScript" },
+  ];
+
   return (
-    <div className="h-12 border-y border-[#1f1f1f] flex items-center justify-center">
-      <div className="flex items-center gap-6 font-mono text-[12px] text-[#a1a1aa]">
-        <span className="flex items-center gap-1.5">
-          <span className="text-[#10b981]">★</span> Open source
-        </span>
-        <span className="text-[#3f3f46]">·</span>
-        <span>MIT licensed</span>
-        <span className="text-[#3f3f46]">·</span>
-        <span>Self-hostable</span>
-        <span className="text-[#3f3f46]">·</span>
-        <span>TypeScript</span>
+    <div className="border-y border-[#1f1f1f] py-3 px-4">
+      <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2 font-mono text-[12px] text-[#a1a1aa]">
+        {items.map((item, i) => (
+          <span key={i} className="flex items-center gap-1.5 whitespace-nowrap">
+            {item.icon && <span className={item.iconColor}>{item.icon}</span>}
+            {item.label}
+          </span>
+        ))}
       </div>
     </div>
   );

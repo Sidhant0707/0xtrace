@@ -69,15 +69,6 @@ const CODE_LINES = [
   { tokens: ["});"], colors: ["tok-c3"] },
 ];
 
-interface Card {
-  category: string;
-  title: string;
-  desc: string;
-  icon: ReactNode;
-  wide?: boolean;
-  soon?: boolean;
-}
-
 const RAW_CODE = `import OpenAI from "openai";
 import { Tracer, wrapOpenAI } from "@prompt-tracer/sdk";
 
@@ -105,26 +96,26 @@ export function CodeSection() {
   }
 
   return (
-    <section className="py-[120px] px-6">
-      <div className="max-w-[1120px] mx-auto grid grid-cols-1 md:grid-cols-2 gap-16 items-center">
+    <section className="py-16 sm:py-[120px] px-4 sm:px-6">
+      <div className="max-w-[1120px] mx-auto grid grid-cols-1 md:grid-cols-2 gap-10 sm:gap-16 items-center">
         <FadeIn direction="left">
           <div>
             <p className="m-0 font-mono text-[12px] text-[#60a5fa] uppercase tracking-[3px]">
               Integration
             </p>
-            <h2 className="m-0 mt-4 text-[clamp(28px,3.5vw,44px)] font-semibold text-white leading-[1.1] tracking-[-0.03em]">
+            <h2 className="m-0 mt-4 text-[clamp(24px,3.5vw,44px)] font-semibold text-white leading-[1.1] tracking-[-0.03em]">
               Drop-in.
               <br />
               Non-blocking.
               <br />
               <span className="text-[#71717a]">Zero latency added.</span>
             </h2>
-            <p className="mt-5 mb-0 text-[16px] text-[#a1a1aa] leading-[1.8]">
+            <p className="mt-5 mb-0 text-[15px] sm:text-[16px] text-[#a1a1aa] leading-[1.8]">
               JavaScript Proxy objects intercept calls — no monkey-patching.
               Telemetry fires on the microtask queue after your code continues.
               Your agent never slows down.
             </p>
-            <div className="mt-8 space-y-4">
+            <div className="mt-6 sm:mt-8 space-y-3 sm:space-y-4">
               {[
                 "Works with streaming responses",
                 "Handles infinite agent loops safely",
@@ -135,9 +126,9 @@ export function CodeSection() {
                   key={item}
                   whileHover={{ x: 4 }}
                   transition={{ duration: 0.15 }}
-                  className="flex items-center gap-3 text-[14px] text-[#a1a1aa] cursor-default"
+                  className="flex items-center gap-3 text-[13px] sm:text-[14px] text-[#a1a1aa] cursor-default"
                 >
-                  <span className="text-[#60a5fa] font-mono">→</span>
+                  <span className="text-[#60a5fa] font-mono shrink-0">→</span>
                   {item}
                 </motion.div>
               ))}
@@ -147,7 +138,8 @@ export function CodeSection() {
 
         <FadeIn direction="right" delay={0.1}>
           <div className="rounded-xl overflow-hidden border border-white/[0.06] bg-[#0d0d0d]/80 backdrop-blur-sm shadow-xl">
-            <div className="flex items-center justify-between px-4 py-3 border-b border-white/[0.04]">
+            {/* Code window header */}
+            <div className="flex items-center justify-between px-3 sm:px-4 py-3 border-b border-white/[0.04]">
               <div className="flex items-center gap-2">
                 <span className="w-2.5 h-2.5 rounded-full bg-[#2a2a2a]" />
                 <span className="w-2.5 h-2.5 rounded-full bg-[#2a2a2a]" />
@@ -172,44 +164,61 @@ export function CodeSection() {
                 )}
               </button>
             </div>
-            <pre className="m-0 p-5 overflow-x-auto leading-[1.8]">
-              <code>
-                {CODE_LINES.map((line, li) => (
-                  <div key={li} className="font-mono text-[13px]">
-                    {line.tokens.map((token, ti) => (
-                      <span key={ti} className={line.colors[ti] || "tok-c1"}>
-                        {token}
-                      </span>
-                    ))}
-                  </div>
-                ))}
-              </code>
-            </pre>
+            {/* Scrollable code block */}
+            <div className="overflow-x-auto">
+              <pre className="m-0 p-4 sm:p-5 leading-[1.8] min-w-0">
+                <code>
+                  {CODE_LINES.map((line, li) => (
+                    <div
+                      key={li}
+                      className="font-mono text-[12px] sm:text-[13px]"
+                    >
+                      {line.tokens.map((token, ti) => (
+                        <span key={ti} className={line.colors[ti] || "tok-c1"}>
+                          {token}
+                        </span>
+                      ))}
+                    </div>
+                  ))}
+                </code>
+              </pre>
+            </div>
           </div>
         </FadeIn>
       </div>
       <style jsx>{`
         .tok-c1 {
           color: #71717a;
-        } /* Keywords/syntax */
+        }
         .tok-c2 {
           color: #e4e4e7;
-        } /* Classes/Variables */
+        }
         .tok-c3 {
           color: #a1a1aa;
-        } /* Strings/Punctuation */
+        }
         .tok-c4 {
           color: #60a5fa;
-        } /* Const/Let/Special */
+        }
         .tok-c5 {
           color: #52525b;
-        } /* Comments */
+        }
       `}</style>
     </section>
   );
 }
 
-const CARDS = [
+/* ─── Bento Features ──────────────────────────────────────────────────────── */
+
+interface Card {
+  category: string;
+  title: string;
+  desc: string;
+  icon: ReactNode;
+  wide?: boolean;
+  soon?: boolean;
+}
+
+const CARDS: Card[] = [
   {
     category: "INTERCEPT",
     title: "Proxy-based capture",
@@ -250,16 +259,16 @@ function BentoCardComponent({ card, index }: BentoCardProps) {
         whileHover={{ borderColor: "rgba(96, 165, 250, 0.3)", y: -2 }}
         transition={{ duration: 0.2 }}
         className={[
-          "relative rounded-xl border p-7 h-full bg-[#0d0d0d]/80 backdrop-blur-sm border-white/[0.05] group",
+          "relative rounded-xl border p-5 sm:p-7 h-full bg-[#0d0d0d]/80 backdrop-blur-sm border-white/[0.05] group",
           card.wide ? "md:col-span-2" : "",
         ].join(" ")}
       >
         {card.soon && (
-          <div className="absolute top-5 right-5 font-mono text-[10px] text-[#60a5fa] bg-[#3b82f6]/10 border border-[#3b82f6]/20 px-2 py-0.5 rounded">
+          <div className="absolute top-4 right-4 sm:top-5 sm:right-5 font-mono text-[10px] text-[#60a5fa] bg-[#3b82f6]/10 border border-[#3b82f6]/20 px-2 py-0.5 rounded">
             SOON
           </div>
         )}
-        <div className="flex items-center gap-3 mb-5">
+        <div className="flex items-center gap-3 mb-4 sm:mb-5">
           {card.icon}
           <span className="font-mono text-[11px] text-[#60a5fa] uppercase tracking-[2.5px]">
             {card.category}
@@ -267,7 +276,7 @@ function BentoCardComponent({ card, index }: BentoCardProps) {
         </div>
         <h3
           className={[
-            "m-0 mb-3 text-[18px] font-semibold leading-tight transition-colors",
+            "m-0 mb-3 text-[16px] sm:text-[18px] font-semibold leading-tight transition-colors",
             card.soon ? "text-[#a1a1aa] group-hover:text-white" : "text-white",
           ].join(" ")}
         >
@@ -275,7 +284,7 @@ function BentoCardComponent({ card, index }: BentoCardProps) {
         </h3>
         <p
           className={[
-            "m-0 text-[14px] leading-[1.75] transition-colors",
+            "m-0 text-[13px] sm:text-[14px] leading-[1.75] transition-colors",
             card.soon
               ? "text-[#71717a] group-hover:text-[#a1a1aa]"
               : "text-[#a1a1aa]",
@@ -290,21 +299,22 @@ function BentoCardComponent({ card, index }: BentoCardProps) {
 
 export function BentoFeatures() {
   return (
-    <section className="py-[120px] px-6 border-y border-white/[0.04]">
+    <section className="py-16 sm:py-[120px] px-4 sm:px-6 border-y border-white/[0.04]">
       <div className="max-w-[1000px] mx-auto">
         <FadeIn direction="up">
-          <div className="text-center mb-14">
+          <div className="text-center mb-10 sm:mb-14">
             <p className="m-0 font-mono text-[12px] text-[#60a5fa] uppercase tracking-[3px]">
               Features
             </p>
-            <h2 className="m-0 mt-4 text-[clamp(28px,3.5vw,44px)] font-semibold text-white leading-[1.1] tracking-[-0.03em]">
+            <h2 className="m-0 mt-4 text-[clamp(24px,3.5vw,44px)] font-semibold text-white leading-[1.1] tracking-[-0.03em]">
               Everything you need
               <br />
               <span className="text-[#71717a]">to stop flying blind.</span>
             </h2>
           </div>
         </FadeIn>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {/* On mobile, all cards are single column. md+ uses the bento layout. */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 sm:gap-4">
           <div className="md:col-span-2">
             <BentoCardComponent card={CARDS[0]} index={0} />
           </div>

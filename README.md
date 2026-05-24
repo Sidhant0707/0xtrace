@@ -1,5 +1,9 @@
 # 0xtrace
 
+<a href="https://codeautopsy-lyart.vercel.app/analyze?repo=Sidhant0707%2F0xtrace">
+  <img src="https://codeautopsy-lyart.vercel.app/api/badge?repo=Sidhant0707%2F0xtrace&v=1" alt="CodeAutopsy Health" />
+</a>
+
 **[→ Live Demo](https://0xtrace-mu.vercel.app/)**
 
 ![0xtrace Dashboard](https://raw.githubusercontent.com/Sidhant0707/0xtrace/main/0xtrace-dashboard-preview.png)

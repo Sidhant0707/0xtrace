@@ -1,410 +1,204 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import { useState } from "react";
 import Link from "next/link";
-import { createClient } from "@/lib/supabase-browser";
-import { Activity, Zap, BarChart3, Loader2 } from "lucide-react";
+import { motion } from "framer-motion";
+import { Loader2 } from "lucide-react";
 import { FaGithub } from "react-icons/fa6";
-import { motion, useMotionValue, useSpring, useTransform } from "framer-motion";
+import { createClient } from "@/lib/supabase-browser";
 
-interface Particle {
-  id: number;
-  x: number;
-  y: number;
-  size: number;
-  opacity: number;
-  duration: number;
-}
+// ── Fade-in animation config ──────────────────────────────────────────────────
+
+const fadeUp = (delay = 0) => ({
+  initial: { opacity: 0, y: 12 },
+  animate: { opacity: 1, y: 0 },
+  transition: {
+    duration: 0.5,
+    delay,
+    ease: [0.21, 0.47, 0.32, 0.98] as [number, number, number, number],
+  },
+});
+
+// ── Feature list ──────────────────────────────────────────────────────────────
+
+const FEATURES = [
+  "Proxy-based capture — zero latency added",
+  "Keyframe + delta prompt storage (85% smaller)",
+  "Token explosion & cost spike detection",
+  "Step-by-step diff viewer and replay engine",
+] as const;
+
+// ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function LoginPage() {
-  const [isLoading, setIsLoading] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [particles, setParticles] = useState<Particle[]>([]);
 
-  const mouseX = useMotionValue(0);
-  const mouseY = useMotionValue(0);
-
-  const springConfig = { damping: 25, stiffness: 100 };
-  const springX = useSpring(mouseX, springConfig);
-  const springY = useSpring(mouseY, springConfig);
-
-  const rotateX = useTransform(springY, [-500, 500], [5, -5]);
-  const rotateY = useTransform(springX, [-500, 500], [-5, 5]);
-  const translateX = useTransform(springX, [-500, 500], [-20, 20]);
-  const translateY = useTransform(springY, [-500, 500], [-20, 20]);
-
-  useEffect(() => {
-    const animationFrame = requestAnimationFrame(() => {
-      setParticles(
-        Array.from({ length: 50 }, (_, i) => ({
-          id: i,
-          x: Math.random() * window.innerWidth,
-          y: Math.random() * window.innerHeight,
-          size: Math.random() * 3 + 1,
-          opacity: Math.random() * 0.5 + 0.2,
-          duration: 3 + Math.random() * 4,
-        })),
-      );
-    });
-
-    const handleMouseMove = (e: MouseEvent) => {
-      const { innerWidth, innerHeight } = window;
-      mouseX.set(e.clientX - innerWidth / 2);
-      mouseY.set(e.clientY - innerHeight / 2);
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-
-    return () => {
-      cancelAnimationFrame(animationFrame);
-      window.removeEventListener("mousemove", handleMouseMove);
-    };
-  }, [mouseX, mouseY]);
-
-  async function handleGitHubSignIn() {
-    setIsLoading(true);
+  async function handleSignIn() {
+    setLoading(true);
     setError(null);
 
     try {
       const supabase = createClient();
-
-      const { error } = await supabase.auth.signInWithOAuth({
+      const { error: oauthError } = await supabase.auth.signInWithOAuth({
         provider: "github",
-        options: {
-          redirectTo: `${window.location.origin}/auth/callback`,
-        },
+        options: { redirectTo: `${window.location.origin}/auth/callback` },
       });
-
-      if (error) throw error;
-
-      // User will be redirected to GitHub, don't stop loading
+      if (oauthError) throw oauthError;
+      // Loading stays true — user is being redirected to GitHub
     } catch (err) {
-      console.error("Sign in error:", err);
-      setError("Failed to sign in with GitHub. Please try again.");
-      setIsLoading(false);
+      setError(err instanceof Error ? err.message : "Authentication failed.");
+      setLoading(false);
     }
   }
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-50 flex flex-col md:flex-row overflow-hidden relative">
-      <style
-        dangerouslySetInnerHTML={{
-          __html: `
-          .perspective-grid {
-            background-size: 50px 50px;
-            background-image: 
-              linear-gradient(to right, rgba(16, 185, 129, 0.05) 1px, transparent 1px),
-              linear-gradient(to bottom, rgba(16, 185, 129, 0.05) 1px, transparent 1px);
-            transform-style: preserve-3d;
-            mask-image: radial-gradient(ellipse at center, black 20%, transparent 70%);
-          }
-          
-          @keyframes shimmer {
-            0% { background-position: -1000px 0; }
-            100% { background-position: 1000px 0; }
-          }
-          
-          .shimmer {
-            background: linear-gradient(
-              90deg,
-              transparent,
-              rgba(16, 185, 129, 0.1),
-              transparent
-            );
-            background-size: 1000px 100%;
-            animation: shimmer 3s infinite;
-          }
-
-          .magnetic-btn {
-            transition: transform 0.2s ease-out;
-          }
-
-          .magnetic-btn:hover {
-            transform: scale(1.02);
-          }
-        `,
-        }}
-      />
-
-      {/* Particle Background */}
-      <div className="absolute inset-0 z-0 pointer-events-none overflow-hidden">
-        {particles.map((particle) => (
-          <motion.div
-            key={particle.id}
-            className="absolute rounded-full bg-emerald-500"
-            style={{
-              left: particle.x,
-              top: particle.y,
-              width: particle.size,
-              height: particle.size,
-              opacity: particle.opacity,
-            }}
-            animate={{
-              y: [0, -40, 0],
-              x: [0, 30, 0],
-              opacity: [
-                particle.opacity,
-                particle.opacity * 0.3,
-                particle.opacity,
-              ],
-            }}
-            transition={{
-              duration: particle.duration,
-              repeat: Infinity,
-              ease: "easeInOut",
-            }}
-          />
-        ))}
+    <div className="min-h-screen bg-[#0a0a0a] flex">
+      {/* ── Subtle background grid ── */}
+      <div className="fixed inset-0 pointer-events-none z-0">
+        <div className="absolute inset-0 opacity-[0.025] bg-[linear-gradient(#fff_1px,transparent_1px),linear-gradient(90deg,#fff_1px,transparent_1px)] bg-[length:48px_48px]" />
+        <div className="absolute top-0 left-0 right-0 h-[500px] bg-[radial-gradient(ellipse_at_top_left,_var(--tw-gradient-stops))] from-[#3b82f6]/8 via-transparent to-transparent" />
       </div>
 
-      {/* Perspective Grid */}
-      <motion.div
-        className="absolute inset-0 z-0 pointer-events-none perspective-grid"
-        style={{
-          rotateX,
-          rotateY,
-          x: translateX,
-          y: translateY,
-          scale: 1.2,
-        }}
-      />
+      {/* ── LEFT: Product context ── */}
+      <div className="hidden lg:flex lg:w-[55%] flex-col justify-between p-16 border-r border-[#1f1f1f] relative z-10">
+        {/* Logo */}
+        <Link href="/" className="flex items-center gap-2.5 no-underline w-fit">
+          <div className="w-8 h-8 bg-white rounded flex items-center justify-center font-mono font-semibold text-[13px] text-black">
+            0x
+          </div>
+          <span className="font-mono text-white text-[15px] font-semibold">
+            0xtrace
+          </span>
+        </Link>
 
-      {/* Left Column (Hero Section) */}
-      <div className="hidden md:flex md:w-1/2 lg:w-3/5 p-12 lg:p-24 flex-col justify-between relative z-10 border-r border-zinc-800 bg-zinc-950/80 backdrop-blur-sm">
-        <div className="absolute inset-0 opacity-30 bg-[radial-gradient(ellipse_at_top_left,_var(--tw-gradient-stops))] from-emerald-900/40 via-transparent to-transparent pointer-events-none" />
+        {/* Hero copy */}
+        <motion.div {...fadeUp(0.1)} className="max-w-[460px]">
+          <p className="font-mono text-[11px] text-[#3b82f6] uppercase tracking-[3px] mb-5">
+            AI Observability
+          </p>
+          <h1 className="m-0 text-white text-[38px] font-semibold leading-[1.15] tracking-[-0.03em] mb-6">
+            Stop guessing why
+            <br />
+            <span className="text-[#52525b]">your agent failed.</span>
+          </h1>
+          <p className="m-0 text-[#71717a] text-[15px] leading-[1.8] mb-10">
+            Intercept every LLM call, visualize the exact prompt delta at each
+            step, and catch cost explosions before they hit your bill.
+          </p>
 
-        <motion.div
-          style={{
-            x: useTransform(springX, [-500, 500], [-30, 30]),
-            y: useTransform(springY, [-500, 500], [-30, 30]),
-          }}
-          className="absolute top-1/4 -left-20 w-96 h-96 bg-emerald-500/20 rounded-full blur-[120px] pointer-events-none"
-        />
+          {/* Feature list */}
+          <div className="flex flex-col gap-3.5">
+            {FEATURES.map((f, i) => (
+              <motion.div
+                key={f}
+                {...fadeUp(0.3 + i * 0.08)}
+                className="flex items-center gap-3"
+              >
+                <span className="flex-none w-1.5 h-1.5 rounded-full bg-[#3b82f6]" />
+                <span className="text-[#a1a1aa] text-[13px]">{f}</span>
+              </motion.div>
+            ))}
+          </div>
+        </motion.div>
 
-        <div className="relative z-10">
-          <Link href="/" className="flex items-center gap-3 mb-16 group w-fit">
-            <motion.div
-              className="w-10 h-10 bg-emerald-500 rounded-lg flex items-center justify-center text-zinc-950 font-bold text-xl shadow-[0_0_20px_rgba(16,185,129,0.5)]"
-              whileHover={{ scale: 1.1, rotate: 5 }}
-              transition={{ type: "spring", stiffness: 400 }}
-            >
+        {/* Bottom meta */}
+        <motion.div {...fadeUp(0.7)} className="flex items-center gap-2">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#10b981]" />
+          <span className="font-mono text-[11px] text-[#52525b] uppercase tracking-wider">
+            MIT licensed · open source · self-hostable
+          </span>
+        </motion.div>
+      </div>
+
+      {/* ── RIGHT: Auth card ── */}
+      <div className="flex-1 flex flex-col items-center justify-center px-6 py-12 relative z-10">
+        {/* Mobile logo */}
+        <motion.div {...fadeUp(0)} className="lg:hidden mb-12">
+          <Link href="/" className="flex items-center gap-2.5 no-underline">
+            <div className="w-8 h-8 bg-white rounded flex items-center justify-center font-mono font-semibold text-[13px] text-black">
               0x
-            </motion.div>
-            <span className="text-2xl font-bold tracking-tight text-white">
+            </div>
+            <span className="font-mono text-white text-[15px] font-semibold">
               0xtrace
             </span>
           </Link>
+        </motion.div>
 
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.8, delay: 0.2 }}
-            style={{
-              x: useTransform(springX, [-500, 500], [-10, 10]),
-              y: useTransform(springY, [-500, 500], [-10, 10]),
-            }}
-            className="max-w-xl"
-          >
-            <h1 className="text-5xl lg:text-6xl font-extrabold leading-[1.1] mb-8 tracking-tight">
-              Ship LLM apps with{" "}
-              <motion.span
-                className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-green-500 inline-block"
-                initial={{ opacity: 0, scale: 0.9 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ duration: 0.5, delay: 0.5 }}
-              >
-                confidence.
-              </motion.span>
-            </h1>
-            <motion.p
-              className="text-xl text-zinc-400 leading-relaxed mb-12"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ duration: 0.8, delay: 0.6 }}
-            >
-              Stop guessing why your agent failed. Visualize prompt deltas,
-              track context bloat, and optimize costs in real-time.
-            </motion.p>
-
-            <div className="flex flex-col gap-6">
-              {[
-                {
-                  icon: Activity,
-                  text: "Context window visualization",
-                  color: "text-emerald-400",
-                },
-                {
-                  icon: Zap,
-                  text: "Real-time diff tracking",
-                  color: "text-yellow-400",
-                },
-                {
-                  icon: BarChart3,
-                  text: "Cost & latency analytics",
-                  color: "text-blue-400",
-                },
-              ].map(({ icon: Icon, text, color }, index) => (
-                <motion.div
-                  key={text}
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ duration: 0.5, delay: 0.8 + index * 0.1 }}
-                  className="flex items-center gap-4 group cursor-pointer"
-                  whileHover={{ x: 5 }}
-                >
-                  <motion.div
-                    className="w-8 h-8 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center group-hover:bg-emerald-500/20 group-hover:border-emerald-500/50 transition-colors"
-                    whileHover={{ scale: 1.1, rotate: 5 }}
-                  >
-                    <Icon className={`w-4 h-4 ${color}`} />
-                  </motion.div>
-                  <span className="font-medium text-zinc-300 group-hover:text-white transition-colors">
-                    {text}
-                  </span>
-                </motion.div>
-              ))}
-            </div>
-          </motion.div>
-        </div>
-
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.8, delay: 1.2 }}
-          className="relative z-10"
-        >
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2">
-              <motion.div
-                className="w-2 h-2 rounded-full bg-emerald-500"
-                animate={{
-                  scale: [1, 1.2, 1],
-                  opacity: [1, 0.7, 1],
-                }}
-                transition={{
-                  duration: 2,
-                  repeat: Infinity,
-                  ease: "easeInOut",
-                }}
-              />
-              <p className="text-sm text-zinc-600 font-mono uppercase tracking-widest">
-                SYSTEM: <span className="text-emerald-500">ONLINE</span>
+        <motion.div {...fadeUp(0.15)} className="w-full max-w-[380px]">
+          {/* Card */}
+          <div className="bg-[#111] border border-[#1f1f1f] rounded-xl p-8">
+            {/* Header */}
+            <div className="mb-8">
+              <h2 className="m-0 text-white text-[20px] font-semibold tracking-[-0.02em]">
+                Sign in to 0xtrace
+              </h2>
+              <p className="mt-2 mb-0 text-[#71717a] text-[13px]">
+                Developer observability for LLM applications.
               </p>
             </div>
-          </div>
-        </motion.div>
-      </div>
 
-      {/* Right Column (Auth Card) */}
-      <div className="flex-1 flex flex-col items-center justify-center p-6 sm:p-12 lg:p-24 bg-zinc-950/80 backdrop-blur-xl relative z-10">
-        <motion.div
-          className="md:hidden mb-12"
-          initial={{ opacity: 0, y: -20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5 }}
-        >
-          <Link href="/" className="flex items-center gap-3 group">
-            <motion.div
-              className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-zinc-950 font-bold text-xl shadow-[0_0_15px_rgba(16,185,129,0.5)]"
-              whileHover={{ scale: 1.1, rotate: 5 }}
-              transition={{ type: "spring", stiffness: 400 }}
-            >
-              0x
-            </motion.div>
-            <span className="text-xl font-bold text-white">0xtrace</span>
-          </Link>
-        </motion.div>
-
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5, delay: 0.2 }}
-          className="w-full max-w-[420px] relative"
-        >
-          <div className="absolute -inset-4 bg-gradient-to-r from-emerald-500/20 to-green-500/20 rounded-3xl blur-2xl opacity-50" />
-
-          <div className="relative bg-zinc-900/40 rounded-2xl p-10 border border-zinc-800 backdrop-blur-sm shadow-2xl">
-            <div className="mb-8 text-center">
-              <motion.h2
-                className="text-3xl font-bold mb-3 tracking-tight"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ duration: 0.5, delay: 0.3 }}
-              >
-                Welcome to 0xtrace
-              </motion.h2>
-              <motion.p
-                className="text-zinc-400 text-sm"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ duration: 0.5, delay: 0.4 }}
-              >
-                Sign in with GitHub to start tracking your LLM applications
-              </motion.p>
-            </div>
-
+            {/* Error */}
             {error && (
               <motion.div
-                initial={{ opacity: 0, y: -10 }}
+                initial={{ opacity: 0, y: -4 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="mb-6 p-4 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm flex items-center gap-3"
+                className="mb-5 px-4 py-3 bg-[#1f0a0a] border border-[#4a1111] rounded-lg text-[#f43f5e] text-[13px]"
               >
-                <motion.div
-                  className="w-1.5 h-1.5 rounded-full bg-red-500"
-                  animate={{ scale: [1, 1.2, 1] }}
-                  transition={{ duration: 1, repeat: Infinity }}
-                />
                 {error}
               </motion.div>
             )}
 
-            <motion.button
-              onClick={handleGitHubSignIn}
-              disabled={isLoading}
-              className="magnetic-btn bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 hover:border-emerald-500/50 px-6 py-4 rounded-xl flex items-center justify-center gap-4 text-sm font-bold active:scale-95 disabled:opacity-50 transition-all group relative overflow-hidden w-full"
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
+            {/* GitHub button */}
+            <button
+              type="button"
+              onClick={handleSignIn}
+              disabled={loading}
+              className={[
+                "w-full h-11 rounded-lg",
+                "flex items-center justify-center gap-3",
+                "text-[14px] font-semibold",
+                "transition-all duration-150 active:scale-[0.98]",
+                loading
+                  ? "bg-[#1e3a5f] border border-[#1e3a8a] text-[#60a5fa] cursor-not-allowed"
+                  : "bg-[#3b82f6] text-white hover:bg-[#2563eb] shadow-[0_0_20px_rgba(59,130,246,0.2)]",
+              ].join(" ")}
             >
-              <div className="absolute inset-0 shimmer opacity-0 group-hover:opacity-100" />
-              {isLoading ? (
-                <Loader2 className="w-5 h-5 animate-spin text-zinc-400" />
+              {loading ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
               ) : (
-                <FaGithub className="text-xl relative z-10 text-white" />
+                <FaGithub className="w-4 h-4" />
               )}
-              <span className="relative z-10 text-base tracking-wide text-white">
-                {isLoading ? "Redirecting..." : "Continue with GitHub"}
+              {loading ? "Redirecting to GitHub…" : "Continue with GitHub"}
+            </button>
+
+            {/* Divider */}
+            <div className="my-6 flex items-center gap-3">
+              <div className="flex-1 h-px bg-[#1f1f1f]" />
+              <span className="text-[#3f3f46] text-[11px] font-mono uppercase tracking-wider">
+                what you get
               </span>
-            </motion.button>
+              <div className="flex-1 h-px bg-[#1f1f1f]" />
+            </div>
 
-            <motion.div
-              className="mt-8 text-center"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ duration: 0.5, delay: 0.7 }}
-            >
-              <p className="text-xs text-zinc-500">
-                By continuing, you agree to our{" "}
-                <Link
-                  href="#"
-                  className="text-zinc-400 hover:text-white transition-colors underline decoration-zinc-700 underline-offset-2"
-                >
-                  Terms of Service
-                </Link>
-              </p>
-            </motion.div>
+            {/* Mini feature list for mobile */}
+            <div className="flex flex-col gap-2.5">
+              {FEATURES.map((f) => (
+                <div key={f} className="flex items-start gap-2.5">
+                  <span className="flex-none mt-[5px] w-1 h-1 rounded-full bg-[#3b82f6]" />
+                  <span className="text-[#52525b] text-[12px] leading-relaxed">
+                    {f}
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
-        </motion.div>
 
-        {/* Footer info for mobile */}
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.8, delay: 1 }}
-          className="md:hidden mt-12 text-center max-w-xs"
-        >
-          <p className="text-sm text-zinc-600">
-            Track context window bloat · Visualize prompt deltas · Optimize
-            costs
+          {/* Footer note */}
+          <p className="mt-5 text-center font-mono text-[11px] text-[#3f3f46]">
+            Your traces are private and isolated to your account.
+            <br />
+            We never train on your data.
           </p>
         </motion.div>
       </div>

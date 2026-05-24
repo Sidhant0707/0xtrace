@@ -26,22 +26,31 @@ export default async function proxy(request: NextRequest) {
     }
   );
 
-  const { data: { user } } = await supabase.auth.getUser();
+  const { data: { user }, error } = await supabase.auth.getUser();
 
-  // ── Unauthenticated: block dashboard and onboarding ──────────────────────
-  if (!user) {
-    const isProtected =
-      request.nextUrl.pathname.startsWith("/dashboard") ||
-      request.nextUrl.pathname.startsWith("/onboarding");
+  const isProtected =
+    request.nextUrl.pathname.startsWith("/dashboard") ||
+    request.nextUrl.pathname.startsWith("/onboarding");
 
-    if (isProtected) {
-      const url = request.nextUrl.clone();
-      url.pathname = "/login";
-      return NextResponse.redirect(url);
-    }
+  // ── Stale or invalid token → clear cookies and redirect to login ──────────
+  if (error && isProtected) {
+    const url = request.nextUrl.clone();
+    url.pathname = "/login";
+    const response = NextResponse.redirect(url);
+    request.cookies.getAll().forEach(({ name }) => {
+      if (name.startsWith("sb-")) response.cookies.delete(name);
+    });
+    return response;
   }
 
-  // ── Authenticated: redirect away from login ───────────────────────────────
+  // ── Unauthenticated → block protected routes ──────────────────────────────
+  if (!user && isProtected) {
+    const url = request.nextUrl.clone();
+    url.pathname = "/login";
+    return NextResponse.redirect(url);
+  }
+
+  // ── Authenticated → redirect away from login ──────────────────────────────
   if (user && request.nextUrl.pathname === "/login") {
     const url = request.nextUrl.clone();
     url.pathname = "/dashboard";

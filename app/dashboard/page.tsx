@@ -1,15 +1,19 @@
 // app/dashboard/page.tsx
-// ============================================================================
-// UPDATED FOR v2 MULTI-TENANCY - All queries now scoped to project_id
-// ============================================================================
 
 import type { Metadata } from "next";
 import type { SearchParams } from "@/types/next";
 import { supabaseAdmin } from "@/lib/supabase";
 import { SessionsTable } from "@/components/dashboard/SessionsTable";
 import { MetricCard } from "@/components/dashboard/MetricCard";
+import { EmptyState } from "@/components/dashboard/EmptyState";
 import { formatCostUsd } from "@/lib/cost";
-import { getActiveProjectId } from "@/lib/project-context"; // ← CRITICAL: Added import
+import { getActiveProjectId } from "@/lib/project-context";
+
+// ── Metadata ──────────────────────────────────────────────────────────────────
+
+export const metadata: Metadata = { title: "Sessions" };
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface LlmCallRaw {
   session_id: string;
@@ -22,15 +26,6 @@ interface LlmCallRaw {
   timestamp: string;
 }
 
-// ── Metadata ──────────────────────────────────────────────────────────────────
-
-export const metadata: Metadata = {
-  title: "Sessions",
-};
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-/** One row from llm_calls as returned by the sessions query. */
 export interface SessionRow {
   session_id: string;
   model: string;
@@ -39,10 +34,9 @@ export interface SessionRow {
   total_cost_usd: number;
   avg_latency_ms: number;
   has_anomaly: boolean;
-  last_call_at: string; // ISO-8601
+  last_call_at: string;
 }
 
-/** Aggregated metrics for the metric strip. */
 interface DashboardMetrics {
   total_calls: number;
   total_cost_usd: number;
@@ -50,7 +44,6 @@ interface DashboardMetrics {
   anomaly_count: number;
 }
 
-/** Shape of Next.js App Router searchParams prop. */
 interface PageProps {
   searchParams: SearchParams;
 }
@@ -58,45 +51,27 @@ interface PageProps {
 // ── Data fetching ─────────────────────────────────────────────────────────────
 
 async function getSessions(
-  projectId: string, // ← CRITICAL: Added parameter
-  filters: {
-    model?: string;
-    status?: string;
-    q?: string;
-  },
+  projectId: string,
+  filters: { model?: string; status?: string; q?: string },
 ): Promise<SessionRow[]> {
-  // We aggregate per session_id in JS because Supabase's PostgREST
-  // doesn't support GROUP BY. For production scale, replace with a
-  // Postgres view or RPC function.
   let query = supabaseAdmin
     .from("llm_calls")
     .select(
-      "session_id, model, tokens_in, tokens_out, latency_ms, " +
-        "estimated_cost_usd, metadata, timestamp",
+      "session_id, model, tokens_in, tokens_out, latency_ms, estimated_cost_usd, metadata, timestamp",
     )
-    .eq("project_id", projectId) // ← CRITICAL: Added filter
+    .eq("project_id", projectId)
     .order("timestamp", { ascending: false });
 
-  if (filters.model) {
-    query = query.eq("model", filters.model);
-  }
-  if (filters.q) {
-    query = query.ilike("session_id", `${filters.q}%`);
-  }
+  if (filters.model) query = query.eq("model", filters.model);
+  if (filters.q) query = query.ilike("session_id", `${filters.q}%`);
 
   const { data, error } = (await query.limit(500)) as {
     data: LlmCallRaw[] | null;
     error: Error | null;
   };
 
-  if (error) {
-    console.error("[sessions] query failed:", error.message);
-    return [];
-  }
+  if (error || !data || data.length === 0) return [];
 
-  if (!data || data.length === 0) return [];
-
-  // ── Aggregate by session_id ──────────────────────────────────────────────
   const sessionMap = new Map<string, SessionRow>();
 
   for (const row of data) {
@@ -124,57 +99,38 @@ async function getSessions(
         (existing.avg_latency_ms * (existing.step_count - 1) + row.latency_ms) /
         existing.step_count;
       existing.has_anomaly = existing.has_anomaly || isAnomaly;
-      // Keep the most recent timestamp as last_call_at
-      if (row.timestamp > existing.last_call_at) {
+      if (row.timestamp > existing.last_call_at)
         existing.last_call_at = row.timestamp;
-      }
     }
   }
 
   let sessions = Array.from(sessionMap.values());
 
-  // ── Post-aggregate status filter ─────────────────────────────────────────
-  if (filters.status === "anomaly") {
+  if (filters.status === "anomaly")
     sessions = sessions.filter((s) => s.has_anomaly);
-  } else if (filters.status === "complete") {
+  if (filters.status === "complete")
     sessions = sessions.filter((s) => !s.has_anomaly);
-  }
 
-  // Sort sessions by most recent call descending
   sessions.sort((a, b) => (a.last_call_at < b.last_call_at ? 1 : -1));
-
   return sessions;
 }
 
 async function getMetrics(projectId: string): Promise<DashboardMetrics> {
-  // ← CRITICAL: Added parameter
   const { data, error } = (await supabaseAdmin
     .from("llm_calls")
     .select("tokens_in, tokens_out, latency_ms, estimated_cost_usd, metadata")
     .eq("project_id", projectId)) as {
-    // ← CRITICAL: Added filter
-    data:
-      | Pick<
-          LlmCallRaw,
-          | "tokens_in"
-          | "tokens_out"
-          | "latency_ms"
-          | "estimated_cost_usd"
-          | "metadata"
-        >[]
-      | null;
+    data: LlmCallRaw[] | null;
     error: Error | null;
   };
 
-  if (error || !data) {
-    console.error("[metrics] query failed:", error?.message);
+  if (error || !data)
     return {
       total_calls: 0,
       total_cost_usd: 0,
       avg_latency_ms: 0,
       anomaly_count: 0,
     };
-  }
 
   const total_calls = data.length;
   const total_cost_usd = data.reduce(
@@ -193,22 +149,18 @@ async function getMetrics(projectId: string): Promise<DashboardMetrics> {
 }
 
 async function getDistinctModels(projectId: string): Promise<string[]> {
-  // ← CRITICAL: Added parameter
   const { data, error } = await supabaseAdmin
     .from("llm_calls")
     .select("model")
-    .eq("project_id", projectId); // ← CRITICAL: Added filter
+    .eq("project_id", projectId);
 
   if (error || !data) return [];
-
-  const models = [...new Set(data.map((r) => r.model as string))].sort();
-  return models;
+  return [...new Set(data.map((r) => r.model as string))].sort();
 }
 
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default async function SessionsPage({ searchParams }: PageProps) {
-  // ── CRITICAL: Get active project ID (validates ownership) ────────────────
   const projectId = await getActiveProjectId();
 
   const params = await searchParams;
@@ -216,16 +168,31 @@ export default async function SessionsPage({ searchParams }: PageProps) {
   const status = typeof params.status === "string" ? params.status : undefined;
   const q = typeof params.q === "string" ? params.q : undefined;
 
-  // ── CRITICAL: Pass projectId to all functions ─────────────────────────────
   const [sessions, metrics, models] = await Promise.all([
     getSessions(projectId, { model, status, q }),
     getMetrics(projectId),
     getDistinctModels(projectId),
   ]);
 
+  // ── Empty state — only when no filters applied and no data ────────────────
+  if (sessions.length === 0 && !model && !status && !q) {
+    return (
+      <div>
+        <div className="mb-6">
+          <h1 className="m-0 text-white text-2xl font-medium leading-tight tracking-[-0.02em]">
+            Sessions
+          </h1>
+          <p className="mt-1.5 text-[#71717a] text-sm m-0">
+            Waiting for first trace
+          </p>
+        </div>
+        <EmptyState context="sessions" />
+      </div>
+    );
+  }
+
   return (
     <div>
-      {/* ── Page header ── */}
       <div className="flex items-end justify-between gap-6 mb-6">
         <div>
           <h1 className="m-0 text-white text-2xl font-medium leading-tight tracking-[-0.02em]">
@@ -238,7 +205,6 @@ export default async function SessionsPage({ searchParams }: PageProps) {
         </div>
       </div>
 
-      {/* ── Metric strip ── */}
       <div className="grid grid-cols-4 gap-4 mb-6">
         <MetricCard
           label="Total Calls"
@@ -262,7 +228,6 @@ export default async function SessionsPage({ searchParams }: PageProps) {
         />
       </div>
 
-      {/* ── Sessions table (client component for interactivity) ── */}
       <SessionsTable
         sessions={sessions}
         models={models}

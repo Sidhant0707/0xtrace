@@ -367,16 +367,17 @@ export function ExplorerTable({
         {/* ── Table ── */}
         <div className="overflow-x-auto">
           <table className="w-full border-collapse table-fixed min-w-[960px]">
+            {/* Column widths: Status | Session ID | Model | Tokens In | Tokens Out | Total | Cost | Latency | Time */}
             <colgroup>
-              <col className="w-[56px]" /> {/* Status     */}
-              <col className="w-[150px]" /> {/* Session ID */}
-              <col className="w-[160px]" /> {/* Model      */}
-              <col className="w-[90px]" /> {/* Tokens in  */}
-              <col className="w-[90px]" /> {/* Tokens out */}
-              <col className="w-[110px]" /> {/* Total      */}
-              <col className="w-[100px]" /> {/* Cost       */}
-              <col className="w-[100px]" /> {/* Latency    */}
-              <col className="w-[110px]" /> {/* Time       */}
+              <col className="w-[56px]" />
+              <col className="w-[150px]" />
+              <col className="w-[160px]" />
+              <col className="w-[90px]" />
+              <col className="w-[90px]" />
+              <col className="w-[110px]" />
+              <col className="w-[100px]" />
+              <col className="w-[100px]" />
+              <col className="w-[110px]" />
             </colgroup>
 
             <thead>

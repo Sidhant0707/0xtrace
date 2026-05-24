@@ -153,7 +153,7 @@ export function ProjectSwitcher({
             {/* Footer: new project link */}
             <div className="border-t border-[#1f1f1f] py-1">
               <a
-                href="/onboarding"
+                href="/onboarding?new=true"
                 className={[
                   "w-full h-9 px-3",
                   "flex items-center gap-2.5 text-[13px] text-[#52525b]",

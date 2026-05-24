@@ -1,24 +1,16 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// packages/sdk/src/index.ts
-// Public surface of the @prompt-tracer/sdk package.
-// ─────────────────────────────────────────────────────────────────────────────
+export { Tracer }      from "./core/tracer";
+export { Dispatcher }  from "./core/dispatcher";
 
-// Core
-export { Tracer }          from "./core/tracer";
-export { Dispatcher }      from "./core/dispatcher";
+export { wrapOpenAI }  from "./wrappers/openai";
 
-// Wrappers
-export { wrapOpenAI }      from "./wrappers/openai";
-
-// Utilities
 export { calcCostUsd, formatCostUsd } from "./utils/cost";
 
-// Types — consumers can import these without `import type` gymnastics
 export type {
   ChatMessage,
   RawCapturePayload,
   TracePayload,
   TracerOptions,
   IDispatcher,
+  PromptResolution,
 } from "./core/types";
 export type { DispatcherOptions } from "./core/dispatcher";

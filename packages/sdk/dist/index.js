@@ -225,7 +225,10 @@ function formatCostUsd(usd) {
 }
 
 // src/core/tracer.ts
-var SDK_VERSION = "0.1.0";
+var SDK_VERSION = "0.2.0";
+var ANOMALY_LATENCY_MS = 1e4;
+var ANOMALY_TOKEN_THRESHOLD = 5e4;
+var DEFAULT_TIMEOUT_MS2 = 5e3;
 function uuid() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -238,16 +241,17 @@ function uuid() {
 }
 var Tracer = class {
   constructor(opts, dispatcher) {
-    /**
-     * Monotonically increasing step counter.
-     * Step 1 → first call in the session (triggers full snapshot in the DB).
-     * Step N → subsequent calls (store diff only).
-     */
     this.stepCounter = 0;
-    var _a, _b, _c;
+    var _a, _b, _c, _d, _e;
     this.sessionId = (_a = opts.sessionId) != null ? _a : uuid();
     this.metadata = (_b = opts.metadata) != null ? _b : {};
     this.enabled = (_c = opts.enabled) != null ? _c : true;
+    this.apiKey = opts.apiKey;
+    this.timeoutMs = (_d = opts.timeoutMs) != null ? _d : DEFAULT_TIMEOUT_MS2;
+    const raw = (_e = opts.samplingRate) != null ? _e : 1;
+    this.samplingRate = Math.min(1, Math.max(0.01, raw));
+    const parsed = new URL(opts.ingestUrl);
+    this.resolveBaseUrl = `${parsed.protocol}//${parsed.host}`;
     this.dispatcher = dispatcher != null ? dispatcher : new Dispatcher({
       ingestUrl: opts.ingestUrl,
       apiKey: opts.apiKey,
@@ -255,22 +259,12 @@ var Tracer = class {
       onError: opts.onError ? (err, payloads) => payloads.forEach((p) => opts.onError(err, p)) : void 0
     });
   }
-  // ── Public API ──────────────────────────────────────────────────────────────
-  /**
-   * The method called by every SDK wrapper after intercepting an LLM call.
-   *
-   * Design contract:
-   *   - NEVER awaited by the wrapper; fire-and-forget on microtask queue.
-   *   - Returns void so the wrapper cannot accidentally `await` it.
-   *
-   * @example
-   * // Inside wrappers/openai.ts — after receiving the result:
-   * tracer.captureAsync({ prompt, response, model, tokensIn, tokensOut, latencyMs, isStream });
-   */
   captureAsync(raw) {
     if (!this.enabled) return;
     Promise.resolve().then(() => {
       try {
+        const anomaly = this._isAnomaly(raw);
+        if (!anomaly && Math.random() >= this.samplingRate) return;
         const payload = this._enrich(raw);
         this.dispatcher.send(payload);
       } catch (err) {
@@ -278,35 +272,53 @@ var Tracer = class {
       }
     });
   }
-  /**
-   * Returns the step index the *next* call will be assigned.
-   * Useful for callers who need to know if this is step 1 (full snapshot)
-   * vs. a later step (diff only) before making the LLM call.
-   */
+  async getPrompt(name) {
+    if (!name || name.trim().length === 0) {
+      throw new Error("[PromptTracer] getPrompt: name must be a non-empty string.");
+    }
+    const url = `${this.resolveBaseUrl}/api/prompts/resolve?name=${encodeURIComponent(name)}`;
+    const headers = {};
+    if (this.apiKey) headers["x-api-key"] = this.apiKey;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let response;
+    try {
+      response = await fetch(url, { headers, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (response.status === 404) {
+      throw new Error(
+        `[PromptTracer] getPrompt: prompt "${name}" not found or no deployed version.`
+      );
+    }
+    if (response.status === 401) {
+      throw new Error(
+        "[PromptTracer] getPrompt: invalid or missing API key."
+      );
+    }
+    if (!response.ok) {
+      throw new Error(
+        `[PromptTracer] getPrompt: unexpected response ${response.status}.`
+      );
+    }
+    const data = await response.json();
+    return data;
+  }
   get nextStepIndex() {
     return this.stepCounter + 1;
   }
-  /**
-   * Waits for all buffered and in-flight payloads to be delivered.
-   * Call before process exit or at the end of integration tests.
-   *
-   * @example
-   * afterAll(async () => { await tracer.flush(); });
-   */
   async flush() {
     await this.dispatcher.flush();
   }
-  // ── Private ─────────────────────────────────────────────────────────────────
-  /**
-   * Takes a raw capture from the wrapper and enriches it with:
-   *   - a unique callId
-   *   - the session's sessionId
-   *   - a monotonic stepIndex
-   *   - ISO-8601 timestamp
-   *   - USD cost estimate
-   *   - SDK version string
-   *   - caller metadata
-   */
+  _isAnomaly(raw) {
+    var _a, _b;
+    if (raw.error) return true;
+    if (raw.latencyMs > ANOMALY_LATENCY_MS) return true;
+    const totalTokens = ((_a = raw.tokensIn) != null ? _a : 0) + ((_b = raw.tokensOut) != null ? _b : 0);
+    if (totalTokens > ANOMALY_TOKEN_THRESHOLD) return true;
+    return false;
+  }
   _enrich(raw) {
     var _a, _b;
     this.stepCounter += 1;
@@ -316,13 +328,11 @@ var Tracer = class {
       tokensOut: (_b = raw.tokensOut) != null ? _b : 0
     });
     return __spreadValues(__spreadProps(__spreadValues({
-      // ── Core identity ───────────────────────────────────────────────────
       callId: uuid(),
       sessionId: this.sessionId,
       stepIndex: this.stepCounter,
       timestamp: (/* @__PURE__ */ new Date()).toISOString()
     }, raw), {
-      // ── Enrichment ───────────────────────────────────────────────────────
       estimatedCostUsd,
       sdkVersion: SDK_VERSION
     }), Object.keys(this.metadata).length > 0 ? { metadata: this.metadata } : {});
@@ -359,10 +369,40 @@ function _makeCreateInterceptor(compTarget, tracer) {
     var _a, _b, _c, _d, _e;
     const startMs = Date.now();
     if (params.stream === true) {
-      const stream = await compTarget.create(params);
+      let stream;
+      try {
+        stream = await compTarget.create(params);
+      } catch (err) {
+        tracer.captureAsync({
+          prompt: params.messages,
+          response: "",
+          model: params.model,
+          tokensIn: void 0,
+          tokensOut: void 0,
+          latencyMs: Date.now() - startMs,
+          isStream: true,
+          error: err instanceof Error ? err.message : String(err)
+        });
+        throw err;
+      }
       return _wrapStream(stream, params, startMs, tracer);
     }
-    const result = await compTarget.create(params);
+    let result;
+    try {
+      result = await compTarget.create(params);
+    } catch (err) {
+      tracer.captureAsync({
+        prompt: params.messages,
+        response: "",
+        model: params.model,
+        tokensIn: void 0,
+        tokensOut: void 0,
+        latencyMs: Date.now() - startMs,
+        isStream: false,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      throw err;
+    }
     const latencyMs = Date.now() - startMs;
     tracer.captureAsync({
       prompt: params.messages,
@@ -383,6 +423,7 @@ function _wrapStream(stream, params, startMs, tracer) {
     let fullContent = "";
     let chunkCount = 0;
     let promptTokens;
+    let caughtError;
     try {
       try {
         for (var iter = __forAwait(stream), more, temp, error; more = !(temp = yield new __await(iter.next())).done; more = false) {
@@ -405,19 +446,20 @@ function _wrapStream(stream, params, startMs, tracer) {
             throw error[0];
         }
       }
+    } catch (err) {
+      caughtError = err instanceof Error ? err : new Error(String(err));
+      throw caughtError;
     } finally {
       const latencyMs = Date.now() - startMs;
-      tracer.captureAsync({
+      tracer.captureAsync(__spreadValues({
         prompt: params.messages,
         response: fullContent,
         model: params.model,
         tokensIn: promptTokens,
-        // exact if include_usage was set
         tokensOut: chunkCount,
-        // approximation: 1 chunk ≈ 1 token
         latencyMs,
         isStream: true
-      });
+      }, caughtError ? { error: caughtError.message } : {}));
     }
   });
 }

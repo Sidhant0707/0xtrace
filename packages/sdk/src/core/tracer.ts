@@ -1,29 +1,19 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// packages/sdk/src/core/tracer.ts
-//
-// Responsibilities:
-//   1. Own one logical "session" (a single agent run).
-//   2. Maintain a monotonic step counter across all calls in that session.
-//   3. Enrich a RawCapturePayload into a full TracePayload (ids, cost, ts).
-//   4. Hand the enriched payload to the Dispatcher non-blocking.
-//   5. Expose a flush() for clean shutdown / test assertions.
-// ─────────────────────────────────────────────────────────────────────────────
-
-import { Dispatcher }                            from "./dispatcher";
-import { calcCostUsd }                           from "../utils/cost";
+import { Dispatcher }  from "./dispatcher";
+import { calcCostUsd } from "../utils/cost";
 import type {
   RawCapturePayload,
   TracePayload,
   TracerOptions,
   IDispatcher,
-}                                                from "./types";
+  PromptResolution,
+} from "./types";
 
-// ── SDK version (keep in sync with package.json) ─────────────────────────────
-const SDK_VERSION = "0.1.0";
+const SDK_VERSION = "0.2.0";
 
-// ── UUID helper ──────────────────────────────────────────────────────────────
-// crypto.randomUUID() is available in Node ≥ 14.17, modern browsers, and
-// the Edge runtime. Provide a tiny fallback for exotic environments.
+const ANOMALY_LATENCY_MS     = 10_000;
+const ANOMALY_TOKEN_THRESHOLD = 50_000;
+const DEFAULT_TIMEOUT_MS     = 5_000;
+
 function uuid(): string {
   if (
     typeof crypto !== "undefined" &&
@@ -31,7 +21,6 @@ function uuid(): string {
   ) {
     return crypto.randomUUID();
   }
-  // Fallback: RFC-4122 v4 UUID
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0;
     const v = c === "x" ? r : (r & 0x3) | 0x8;
@@ -39,105 +28,119 @@ function uuid(): string {
   });
 }
 
-// ── Tracer ────────────────────────────────────────────────────────────────────
-
 export class Tracer {
-  /** Groups all LLM calls in this agent run. */
   readonly sessionId: string;
 
-  /** Caller-supplied arbitrary metadata attached to every payload. */
-  private readonly metadata: Record<string, string>;
+  private readonly metadata:        Record<string, string>;
+  private readonly enabled:         boolean;
+  private readonly dispatcher:      IDispatcher;
+  private readonly resolveBaseUrl:  string;
+  private readonly apiKey:          string | undefined;
+  private readonly timeoutMs:       number;
+  private readonly samplingRate:    number;
 
-  /** Whether telemetry is active (can be disabled via options). */
-  private readonly enabled: boolean;
-
-  /** Delivery engine — injectable for unit-testing. */
-  private readonly dispatcher: IDispatcher;
-
-  /**
-   * Monotonically increasing step counter.
-   * Step 1 → first call in the session (triggers full snapshot in the DB).
-   * Step N → subsequent calls (store diff only).
-   */
   private stepCounter = 0;
 
   constructor(opts: TracerOptions, dispatcher?: IDispatcher) {
-    this.sessionId  = opts.sessionId ?? uuid();
-    this.metadata   = opts.metadata  ?? {};
-    this.enabled    = opts.enabled   ?? true;
+    this.sessionId      = opts.sessionId ?? uuid();
+    this.metadata       = opts.metadata  ?? {};
+    this.enabled        = opts.enabled   ?? true;
+    this.apiKey         = opts.apiKey;
+    this.timeoutMs      = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-    // Use an injected dispatcher (useful in tests) or create the real one.
+    const raw = opts.samplingRate ?? 1.0;
+    this.samplingRate = Math.min(1.0, Math.max(0.01, raw));
+
+    const parsed        = new URL(opts.ingestUrl);
+    this.resolveBaseUrl = `${parsed.protocol}//${parsed.host}`;
+
     this.dispatcher = dispatcher ?? new Dispatcher({
-      ingestUrl:       opts.ingestUrl,
+      ingestUrl: opts.ingestUrl,
       apiKey:    opts.apiKey,
-      timeoutMs:       opts.timeoutMs,
-      onError:         opts.onError
+      timeoutMs: opts.timeoutMs,
+      onError:   opts.onError
         ? (err, payloads) => payloads.forEach((p) => opts.onError!(err, p))
         : undefined,
     });
   }
 
-  // ── Public API ──────────────────────────────────────────────────────────────
-
-  /**
-   * The method called by every SDK wrapper after intercepting an LLM call.
-   *
-   * Design contract:
-   *   - NEVER awaited by the wrapper; fire-and-forget on microtask queue.
-   *   - Returns void so the wrapper cannot accidentally `await` it.
-   *
-   * @example
-   * // Inside wrappers/openai.ts — after receiving the result:
-   * tracer.captureAsync({ prompt, response, model, tokensIn, tokensOut, latencyMs, isStream });
-   */
   captureAsync(raw: RawCapturePayload): void {
     if (!this.enabled) return;
 
-    // Schedule enrichment + dispatch asynchronously so it never adds
-    // synchronous latency to the intercepted call path.
     Promise.resolve().then(() => {
       try {
+        const anomaly = this._isAnomaly(raw);
+
+        if (!anomaly && Math.random() >= this.samplingRate) return;
+
         const payload = this._enrich(raw);
         this.dispatcher.send(payload);
       } catch (err) {
-        // Tracer must NEVER throw into user code.
         console.warn("[PromptTracer] Failed to enrich payload:", err);
       }
     });
   }
 
-  /**
-   * Returns the step index the *next* call will be assigned.
-   * Useful for callers who need to know if this is step 1 (full snapshot)
-   * vs. a later step (diff only) before making the LLM call.
-   */
+  async getPrompt(name: string): Promise<PromptResolution> {
+    if (!name || name.trim().length === 0) {
+      throw new Error("[PromptTracer] getPrompt: name must be a non-empty string.");
+    }
+
+    const url = `${this.resolveBaseUrl}/api/prompts/resolve?name=${encodeURIComponent(name)}`;
+
+    const headers: Record<string, string> = {};
+    if (this.apiKey) headers["x-api-key"] = this.apiKey;
+
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    let response: Response;
+    try {
+      response = await fetch(url, { headers, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (response.status === 404) {
+      throw new Error(
+        `[PromptTracer] getPrompt: prompt "${name}" not found or no deployed version.`
+      );
+    }
+
+    if (response.status === 401) {
+      throw new Error(
+        "[PromptTracer] getPrompt: invalid or missing API key."
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        `[PromptTracer] getPrompt: unexpected response ${response.status}.`
+      );
+    }
+
+    const data = (await response.json()) as PromptResolution;
+    return data;
+  }
+
   get nextStepIndex(): number {
     return this.stepCounter + 1;
   }
 
-  /**
-   * Waits for all buffered and in-flight payloads to be delivered.
-   * Call before process exit or at the end of integration tests.
-   *
-   * @example
-   * afterAll(async () => { await tracer.flush(); });
-   */
   async flush(): Promise<void> {
     await this.dispatcher.flush();
   }
 
-  // ── Private ─────────────────────────────────────────────────────────────────
+  private _isAnomaly(raw: RawCapturePayload): boolean {
+    if (raw.error) return true;
+    if (raw.latencyMs > ANOMALY_LATENCY_MS) return true;
 
-  /**
-   * Takes a raw capture from the wrapper and enriches it with:
-   *   - a unique callId
-   *   - the session's sessionId
-   *   - a monotonic stepIndex
-   *   - ISO-8601 timestamp
-   *   - USD cost estimate
-   *   - SDK version string
-   *   - caller metadata
-   */
+    const totalTokens = (raw.tokensIn ?? 0) + (raw.tokensOut ?? 0);
+    if (totalTokens > ANOMALY_TOKEN_THRESHOLD) return true;
+
+    return false;
+  }
+
   private _enrich(raw: RawCapturePayload): TracePayload {
     this.stepCounter += 1;
 
@@ -148,21 +151,16 @@ export class Tracer {
     });
 
     return {
-      // ── Core identity ───────────────────────────────────────────────────
-      callId:     uuid(),
-      sessionId:  this.sessionId,
-      stepIndex:  this.stepCounter,
-      timestamp:  new Date().toISOString(),
+      callId:    uuid(),
+      sessionId: this.sessionId,
+      stepIndex: this.stepCounter,
+      timestamp: new Date().toISOString(),
 
-      // ── Raw capture data (passed through unchanged) ──────────────────────
       ...raw,
 
-      // ── Enrichment ───────────────────────────────────────────────────────
       estimatedCostUsd,
       sdkVersion: SDK_VERSION,
 
-      // Merge metadata into the payload so the ingest API can index on it.
-      // We spread it flat; the ingest schema should have a metadata JSONB col.
       ...(Object.keys(this.metadata).length > 0
         ? { metadata: this.metadata }
         : {}),

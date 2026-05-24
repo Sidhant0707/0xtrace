@@ -1,7 +1,27 @@
 {
   "name": "0xtrace",
-  "version": "1.1.0",
-  "description": "Proxy-based LLM telemetry SDK for 0xtrace",
+  "version": "1.1.1",
+  "description": "AI observability and PromptOps infrastructure for LLM applications.",
+  "author": "Sidhant Kumar <buildwithsidhant@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sidhant0707/0xtrace.git",
+    "directory": "packages/sdk"
+  },
+  "homepage": "https://0xtrace-mu.vercel.app",
+  "bugs": {
+    "url": "https://github.com/Sidhant0707/0xtrace/issues"
+  },
+  "keywords": [
+    "llm",
+    "observability",
+    "openai",
+    "promptops",
+    "tracing",
+    "agents",
+    "telemetry"
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -14,10 +34,12 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "scripts": {
-    "build": "tsup && tsc --project tsconfig.build.json"
+    "build": "tsup && tsc --project tsconfig.build.json",
+    "prepublishOnly": "cp ../../README.md ."
   },
   "dependencies": {
     "diff": "^9.0.0",

@@ -1,7 +1,22 @@
-import Link from "next/link";
+// components/landing/Footer.tsx - FIXED
+// ============================================================================
+// All placeholder href="#" links replaced with real URLs
+// ============================================================================
 
-const PRODUCT_LINKS = ["Dashboard", "Docs", "Changelog"] as const;
-const OSS_LINKS = ["GitHub", "npm", "MIT License"] as const;
+import Link from "next/link";
+import { EXTERNAL_LINKS, INTERNAL_LINKS, externalLinkProps } from "@/lib/links";
+
+const PRODUCT_LINKS = [
+  { label: "Dashboard", href: INTERNAL_LINKS.DASHBOARD },
+  { label: "Docs", href: INTERNAL_LINKS.DOCS },
+  { label: "Changelog", ...externalLinkProps(EXTERNAL_LINKS.GITHUB_CHANGELOG) },
+] as const;
+
+const OSS_LINKS = [
+  { label: "GitHub", ...externalLinkProps(EXTERNAL_LINKS.GITHUB_REPO) },
+  { label: "npm", ...externalLinkProps(EXTERNAL_LINKS.NPM_PACKAGE) },
+  { label: "MIT License", ...externalLinkProps(EXTERNAL_LINKS.MIT_LICENSE) },
+] as const;
 
 export function Footer() {
   return (
@@ -20,7 +35,7 @@ export function Footer() {
             AI observability for agents that ship.
           </p>
           <span className="font-mono text-[11px] text-[#60a5fa] bg-[#3b82f6]/10 border border-[#3b82f6]/20 px-2 py-1 rounded">
-            SDK v0.1.0
+            SDK v1.1.0
           </span>
         </div>
 
@@ -29,10 +44,12 @@ export function Footer() {
             <div className="font-mono text-[11px] text-[#e4e4e7] uppercase tracking-[2px]">
               Product
             </div>
-            {PRODUCT_LINKS.map((label) => (
+            {PRODUCT_LINKS.map(({ label, href, target, rel }) => (
               <div key={label}>
                 <Link
-                  href="#"
+                  href={href}
+                  target={target}
+                  rel={rel}
                   className="text-[14px] text-[#71717a] hover:text-[#e4e4e7] no-underline transition-colors duration-150"
                 >
                   {label}
@@ -45,10 +62,12 @@ export function Footer() {
             <div className="font-mono text-[11px] text-[#e4e4e7] uppercase tracking-[2px]">
               Open Source
             </div>
-            {OSS_LINKS.map((label) => (
+            {OSS_LINKS.map(({ label, href, target, rel }) => (
               <div key={label}>
                 <Link
-                  href="#"
+                  href={href}
+                  target={target}
+                  rel={rel}
                   className="text-[14px] text-[#71717a] hover:text-[#e4e4e7] no-underline transition-colors duration-150"
                 >
                   {label}

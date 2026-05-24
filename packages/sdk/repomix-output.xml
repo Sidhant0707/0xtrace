@@ -1,0 +1,971 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+package.json
+src/core/dispatcher.ts
+src/core/tracer.ts
+src/core/types.ts
+src/diff.ts
+src/index.ts
+src/utils/cost.ts
+src/wrappers/openai.ts
+tsconfig.build.json
+tsup.config.ts
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="package.json">
+{
+  "name": "0xtrace",
+  "version": "1.1.0",
+  "description": "Proxy-based LLM telemetry SDK for 0xtrace",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup && tsc --project tsconfig.build.json"
+  },
+  "dependencies": {
+    "diff": "^9.0.0",
+    "openai": "^6.38.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.0",
+    "cac": "^6.7.14",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3"
+  }
+}
+</file>
+
+<file path="src/core/dispatcher.ts">
+// ─────────────────────────────────────────────────────────────────────────────
+// packages/sdk/src/core/dispatcher.ts
+//
+// Responsibilities:
+//   1. Accept TracePayload objects from the Tracer via a fire-and-forget API.
+//   2. Accumulate payloads in an in-memory micro-batch.
+//   3. Flush the batch to the ingest endpoint as a single POST request.
+//   4. Retry failed requests with exponential back-off (max 3 attempts).
+//   5. NEVER block the caller's thread — every send goes onto the microtask
+//      queue via Promise.resolve().then(...)
+// ─────────────────────────────────────────────────────────────────────────────
+
+import type { IDispatcher, TracePayload } from "./types";
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const DEFAULT_BATCH_SIZE   = 10;    // flush after N payloads accumulate
+const DEFAULT_FLUSH_MS     = 2_000; // flush every 2 s even if batch isn't full
+const DEFAULT_TIMEOUT_MS   = 5_000; // per-request abort timeout
+const MAX_RETRY_ATTEMPTS   = 3;
+const BASE_RETRY_DELAY_MS  = 200;   // doubles on each retry (200 → 400 → 800)
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+export interface DispatcherOptions {
+  ingestUrl: string;
+  apiKey?: string;
+  timeoutMs?: number;
+  batchSize?: number;
+  flushIntervalMs?: number;
+  onError?: (error: Error, payloads: TracePayload[]) => void;
+}
+
+// ── Dispatcher ───────────────────────────────────────────────────────────────
+
+export class Dispatcher implements IDispatcher {
+  private readonly ingestUrl: string;
+  private readonly apiKey: string | undefined;
+  private readonly timeoutMs: number;
+  private readonly batchSize: number;
+  private readonly onError: (error: Error, payloads: TracePayload[]) => void;
+
+  /** The in-memory buffer accumulating payloads between flushes. */
+  private buffer: TracePayload[] = [];
+
+  /** The NodeJS/browser timer handle for the periodic flush. */
+  private flushTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Tracks all in-flight fetch Promises so flush() can await them. */
+  private inFlight = new Set<Promise<void>>();
+
+  constructor(opts: DispatcherOptions) {
+    this.ingestUrl  = opts.ingestUrl;
+    this.apiKey     = opts.apiKey;
+    this.timeoutMs  = opts.timeoutMs  ?? DEFAULT_TIMEOUT_MS;
+    this.batchSize  = opts.batchSize  ?? DEFAULT_BATCH_SIZE;
+
+    this.onError = opts.onError ?? ((err, payloads) => {
+      console.warn(
+        `[PromptTracer] Failed to deliver ${payloads.length} trace(s):`,
+        err.message
+      );
+    });
+
+    // Start the periodic flush timer.
+    const intervalMs = opts.flushIntervalMs ?? DEFAULT_FLUSH_MS;
+    this.flushTimer = setInterval(() => {
+      if (this.buffer.length > 0) {
+        this._drainBuffer();
+      }
+    }, intervalMs);
+
+    // Prevent the timer from keeping a Node process alive indefinitely.
+    if (typeof this.flushTimer === "object" && typeof (this.flushTimer as NodeJS.Timeout).unref === "function") {
+  (this.flushTimer as NodeJS.Timeout).unref();
+    }
+  }
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
+  /**
+   * Accepts a payload and schedules delivery non-blocking via the microtask
+   * queue. The caller returns immediately; the POST happens asynchronously.
+   */
+  send(payload: TracePayload): void {
+    // Schedule the actual buffer-push on the microtask queue so it never
+    // adds synchronous overhead to the intercepted LLM call path.
+    Promise.resolve().then(() => {
+      this.buffer.push(payload);
+
+      if (this.buffer.length >= this.batchSize) {
+        this._drainBuffer();
+      }
+    });
+  }
+
+  /**
+   * Waits for all in-flight requests and flushes any remaining buffered
+   * payloads. Call this in tests or on process shutdown.
+   *
+   * @example
+   * process.on('SIGTERM', () => tracer.flush());
+   */
+  async flush(): Promise<void> {
+    // Flush whatever is sitting in the buffer right now.
+    if (this.buffer.length > 0) {
+      this._drainBuffer();
+    }
+
+    // Await all in-flight POSTs.
+    if (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
+    }
+  }
+
+  /**
+   * Stops the periodic flush timer and flushes remaining payloads.
+   * Call when the Tracer instance is being torn down.
+   */
+  async destroy(): Promise<void> {
+    if (this.flushTimer !== null) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.flush();
+  }
+
+  // ── Private ────────────────────────────────────────────────────────────────
+
+  /**
+   * Atomically snapshots and clears the buffer, then initiates an async
+   * POST. Multiple concurrent drains are safe — each works on its own slice.
+   */
+  private _drainBuffer(): void {
+    const batch = this.buffer.splice(0, this.buffer.length);
+    if (batch.length === 0) return;
+
+    const promise = this._sendWithRetry(batch, 1).finally(() => {
+      this.inFlight.delete(promise);
+    });
+
+    this.inFlight.add(promise);
+  }
+
+  /**
+   * Attempts to POST a batch to the ingest endpoint.
+   * Retries up to MAX_RETRY_ATTEMPTS times with exponential back-off.
+   * Only retries on network errors or 5xx responses.
+   */
+  private async _sendWithRetry(
+    batch: TracePayload[],
+    attempt: number
+  ): Promise<void> {
+    try {
+      await this._post(batch);
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+
+      if (attempt < MAX_RETRY_ATTEMPTS) {
+        const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+        await sleep(delay);
+        return this._sendWithRetry(batch, attempt + 1);
+      }
+
+      // All retries exhausted — surface to the error handler.
+      this.onError(error, batch);
+    }
+  }
+
+  /**
+   * Performs the raw HTTP POST with an AbortController timeout.
+   * Throws on network failure or non-2xx status.
+   */
+  private async _post(batch: TracePayload[]): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (this.apiKey) {
+    headers["x-api-key"] = this.apiKey;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(this.ingestUrl, {
+      method:  "POST",
+      headers,
+      body:    JSON.stringify({ traces: batch }),
+      signal:  controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok) {
+    if (response.status >= 500) {
+      throw new Error(`Ingest endpoint returned ${response.status}`);
+    }
+    console.warn(
+      `[PromptTracer] Ingest rejected batch (${response.status}). ` +
+      `Discarding ${batch.length} trace(s).`
+    );
+  }
+}
+// ── Helpers ──────────────────────────────────────────────────────────────────
+}
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+</file>
+
+<file path="src/core/tracer.ts">
+import { Dispatcher }  from "./dispatcher";
+import { calcCostUsd } from "../utils/cost";
+import type {
+  RawCapturePayload,
+  TracePayload,
+  TracerOptions,
+  IDispatcher,
+  PromptResolution,
+} from "./types";
+
+const SDK_VERSION = "0.2.0";
+
+const ANOMALY_LATENCY_MS     = 10_000;
+const ANOMALY_TOKEN_THRESHOLD = 50_000;
+const DEFAULT_TIMEOUT_MS     = 5_000;
+
+function uuid(): string {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+export class Tracer {
+  readonly sessionId: string;
+
+  private readonly metadata:        Record<string, string>;
+  private readonly enabled:         boolean;
+  private readonly dispatcher:      IDispatcher;
+  private readonly resolveBaseUrl:  string;
+  private readonly apiKey:          string | undefined;
+  private readonly timeoutMs:       number;
+  private readonly samplingRate:    number;
+
+  private stepCounter = 0;
+
+  constructor(opts: TracerOptions, dispatcher?: IDispatcher) {
+    this.sessionId      = opts.sessionId ?? uuid();
+    this.metadata       = opts.metadata  ?? {};
+    this.enabled        = opts.enabled   ?? true;
+    this.apiKey         = opts.apiKey;
+    this.timeoutMs      = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+    const raw = opts.samplingRate ?? 1.0;
+    this.samplingRate = Math.min(1.0, Math.max(0.01, raw));
+
+    const parsed        = new URL(opts.ingestUrl);
+    this.resolveBaseUrl = `${parsed.protocol}//${parsed.host}`;
+
+    this.dispatcher = dispatcher ?? new Dispatcher({
+      ingestUrl: opts.ingestUrl,
+      apiKey:    opts.apiKey,
+      timeoutMs: opts.timeoutMs,
+      onError:   opts.onError
+        ? (err, payloads) => payloads.forEach((p) => opts.onError!(err, p))
+        : undefined,
+    });
+  }
+
+  captureAsync(raw: RawCapturePayload): void {
+    if (!this.enabled) return;
+
+    Promise.resolve().then(() => {
+      try {
+        const anomaly = this._isAnomaly(raw);
+
+        if (!anomaly && Math.random() >= this.samplingRate) return;
+
+        const payload = this._enrich(raw);
+        this.dispatcher.send(payload);
+      } catch (err) {
+        console.warn("[PromptTracer] Failed to enrich payload:", err);
+      }
+    });
+  }
+
+  async getPrompt(name: string): Promise<PromptResolution> {
+    if (!name || name.trim().length === 0) {
+      throw new Error("[PromptTracer] getPrompt: name must be a non-empty string.");
+    }
+
+    const url = `${this.resolveBaseUrl}/api/prompts/resolve?name=${encodeURIComponent(name)}`;
+
+    const headers: Record<string, string> = {};
+    if (this.apiKey) headers["x-api-key"] = this.apiKey;
+
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    let response: Response;
+    try {
+      response = await fetch(url, { headers, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (response.status === 404) {
+      throw new Error(
+        `[PromptTracer] getPrompt: prompt "${name}" not found or no deployed version.`
+      );
+    }
+
+    if (response.status === 401) {
+      throw new Error(
+        "[PromptTracer] getPrompt: invalid or missing API key."
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        `[PromptTracer] getPrompt: unexpected response ${response.status}.`
+      );
+    }
+
+    const data = (await response.json()) as PromptResolution;
+    return data;
+  }
+
+  get nextStepIndex(): number {
+    return this.stepCounter + 1;
+  }
+
+  async flush(): Promise<void> {
+    await this.dispatcher.flush();
+  }
+
+  private _isAnomaly(raw: RawCapturePayload): boolean {
+    if (raw.error) return true;
+    if (raw.latencyMs > ANOMALY_LATENCY_MS) return true;
+
+    const totalTokens = (raw.tokensIn ?? 0) + (raw.tokensOut ?? 0);
+    if (totalTokens > ANOMALY_TOKEN_THRESHOLD) return true;
+
+    return false;
+  }
+
+  private _enrich(raw: RawCapturePayload): TracePayload {
+    this.stepCounter += 1;
+
+    const estimatedCostUsd = calcCostUsd({
+      model:     raw.model,
+      tokensIn:  raw.tokensIn  ?? 0,
+      tokensOut: raw.tokensOut ?? 0,
+    });
+
+    return {
+      callId:    uuid(),
+      sessionId: this.sessionId,
+      stepIndex: this.stepCounter,
+      timestamp: new Date().toISOString(),
+
+      ...raw,
+
+      estimatedCostUsd,
+      sdkVersion: SDK_VERSION,
+
+      ...(Object.keys(this.metadata).length > 0
+        ? { metadata: this.metadata }
+        : {}),
+    } as TracePayload;
+  }
+}
+</file>
+
+<file path="src/core/types.ts">
+export interface ChatMessage {
+  role: "system" | "user" | "assistant" | "tool" | "function";
+  content: string | null;
+  name?: string;
+  tool_call_id?: string;
+}
+
+export interface RawCapturePayload {
+  prompt:    ChatMessage[] | readonly ChatMessage[];
+  response:  string;
+  model:     string;
+  tokensIn:  number | undefined;
+  tokensOut: number | undefined;
+  latencyMs: number;
+  isStream:  boolean;
+  error?:    string;
+}
+
+export interface TracePayload extends RawCapturePayload {
+  callId:           string;
+  sessionId:        string;
+  stepIndex:        number;
+  timestamp:        string;
+  estimatedCostUsd: number;
+  sdkVersion:       string;
+  metadata?:        Record<string, unknown>;
+}
+
+export interface TracerOptions {
+  ingestUrl:    string;
+  apiKey?:      string;
+  sessionId?:   string;
+  metadata?:    Record<string, string>;
+  timeoutMs?:   number;
+  onError?:     (error: Error, payload: TracePayload) => void;
+  enabled?:     boolean;
+  samplingRate?: number;
+}
+
+export interface IDispatcher {
+  send(payload: TracePayload): void;
+  flush(): Promise<void>;
+}
+
+export interface PromptResolution {
+  name:    string;
+  version: string;
+  content: string;
+  model:   string | null;
+}
+</file>
+
+<file path="src/diff.ts">
+// packages/sdk/src/diff.ts
+
+import type { ChatMessage } from "./core/types";
+
+export type DiffOperation =
+  | { op: "add";    index: number; message: ChatMessage }
+  | { op: "remove"; index: number };
+
+export interface MessageDiff {
+  operations: DiffOperation[];
+  tokenDelta: number;
+  added:      number;
+  removed:    number;
+}
+
+// Inline recursive key-sorter — keeps the SDK dependency-free.
+// Handles nested objects inside message content without pulling in
+// json-stable-stringify as an external package.
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value))              return value.map(sortKeys);
+  if (value !== null && typeof value === "object") {
+    return Object.keys(value as object)
+      .sort()
+      .reduce<Record<string, unknown>>((acc, k) => {
+        acc[k] = sortKeys((value as Record<string, unknown>)[k]);
+        return acc;
+      }, {});
+  }
+  return value;
+}
+
+function messageKey(m: ChatMessage): string {
+  return JSON.stringify(sortKeys(m));
+}
+
+export function estimateTokens(messages: readonly ChatMessage[]): number {
+  return messages.reduce(
+    (sum, m) => sum + Math.ceil((m.content ?? "").length / 4),
+    0
+  );
+}
+
+export function computeMessageDiff(
+  prev: readonly ChatMessage[],
+  curr: readonly ChatMessage[]
+): MessageDiff {
+  const prevKeys = new Set(prev.map(messageKey));
+  const currKeys = new Set(curr.map(messageKey));
+
+  const operations: DiffOperation[] = [];
+
+  curr.forEach((message, index) => {
+    if (!prevKeys.has(messageKey(message))) {
+      operations.push({ op: "add", index, message });
+    }
+  });
+
+  prev.forEach((_message, index) => {
+    if (!currKeys.has(messageKey(prev[index]))) {
+      operations.push({ op: "remove", index });
+    }
+  });
+
+  return {
+    operations,
+    tokenDelta: estimateTokens(curr) - estimateTokens(prev),
+    added:      operations.filter((o) => o.op === "add").length,
+    removed:    operations.filter((o) => o.op === "remove").length,
+  };
+}
+
+export function applyDiff(
+  base: readonly ChatMessage[],
+  diff: MessageDiff
+): ChatMessage[] {
+  const result = [...base];
+
+  const removes = diff.operations
+    .filter((o): o is { op: "remove"; index: number } => o.op === "remove")
+    .sort((a, b) => b.index - a.index);
+
+  for (const op of removes) {
+    if (op.index >= result.length) {
+      throw new Error(
+        `[applyDiff] remove index ${op.index} out of bounds (len=${result.length})`
+      );
+    }
+    result.splice(op.index, 1);
+  }
+
+  const adds = diff.operations
+    .filter((o): o is { op: "add"; index: number; message: ChatMessage } =>
+      o.op === "add"
+    )
+    .sort((a, b) => a.index - b.index);
+
+  for (const op of adds) {
+    result.splice(op.index, 0, op.message);
+  }
+
+  return result;
+}
+
+export function replayDiffs(
+  baseSnapshot: readonly ChatMessage[],
+  diffs: MessageDiff[]
+): ChatMessage[][] {
+  const results: ChatMessage[][] = [Array.from(baseSnapshot)];
+
+  for (const diff of diffs) {
+    results.push(applyDiff(results[results.length - 1], diff));
+  }
+
+  return results;
+}
+</file>
+
+<file path="src/index.ts">
+export { Tracer }      from "./core/tracer";
+export { Dispatcher }  from "./core/dispatcher";
+
+export { wrapOpenAI }  from "./wrappers/openai";
+
+export { calcCostUsd, formatCostUsd } from "./utils/cost";
+
+export type {
+  ChatMessage,
+  RawCapturePayload,
+  TracePayload,
+  TracerOptions,
+  IDispatcher,
+  PromptResolution,
+} from "./core/types";
+export type { DispatcherOptions } from "./core/dispatcher";
+</file>
+
+<file path="src/utils/cost.ts">
+// ─────────────────────────────────────────────────────────────────────────────
+// packages/sdk/src/utils/cost.ts
+//
+// Calculates estimated USD cost for a single LLM call.
+// Prices are per 1 million tokens (as published by each provider).
+// Update MODEL_PRICES when providers change pricing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ModelPrice {
+  /** USD per 1M input tokens  */
+  inputPer1M:  number;
+  /** USD per 1M output tokens */
+  outputPer1M: number;
+}
+
+/**
+ * Pricing table keyed by model string.
+ * Keys are matched with startsWith() so "gpt-4o-mini-2024-07-18" resolves
+ * to the "gpt-4o-mini" entry automatically.
+ */
+const MODEL_PRICES: Record<string, ModelPrice> = {
+  // ── OpenAI ──────────────────────────────────────────────────────────────
+  "gpt-4o":                   { inputPer1M:  2.50, outputPer1M: 10.00 },
+  "gpt-4o-mini":              { inputPer1M:  0.15, outputPer1M:  0.60 },
+  "gpt-4-turbo":              { inputPer1M: 10.00, outputPer1M: 30.00 },
+  "gpt-4":                    { inputPer1M: 30.00, outputPer1M: 60.00 },
+  "gpt-3.5-turbo":            { inputPer1M:  0.50, outputPer1M:  1.50 },
+  "o1":                       { inputPer1M: 15.00, outputPer1M: 60.00 },
+  "o1-mini":                  { inputPer1M:  3.00, outputPer1M: 12.00 },
+  "o3-mini":                  { inputPer1M:  1.10, outputPer1M:  4.40 },
+
+  // ── Anthropic ───────────────────────────────────────────────────────────
+  "claude-opus-4":            { inputPer1M: 15.00, outputPer1M: 75.00 },
+  "claude-sonnet-4":          { inputPer1M:  3.00, outputPer1M: 15.00 },
+  "claude-haiku-4":           { inputPer1M:  0.80, outputPer1M:  4.00 },
+  "claude-3-5-sonnet":        { inputPer1M:  3.00, outputPer1M: 15.00 },
+  "claude-3-5-haiku":         { inputPer1M:  0.80, outputPer1M:  4.00 },
+  "claude-3-opus":            { inputPer1M: 15.00, outputPer1M: 75.00 },
+
+  // ── Google ──────────────────────────────────────────────────────────────
+  "gemini-1.5-pro":           { inputPer1M:  3.50, outputPer1M: 10.50 },
+  "gemini-1.5-flash":         { inputPer1M:  0.35, outputPer1M:  1.05 },
+  "gemini-2.0-flash":         { inputPer1M:  0.10, outputPer1M:  0.40 },
+};
+
+/** Fallback when the model string is unrecognised. */
+const UNKNOWN_PRICE: ModelPrice = { inputPer1M: 0, outputPer1M: 0 };
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Resolves a model string to its price entry.
+ * Tries exact match first, then prefix match (handles dated model variants).
+ */
+function resolvePrice(model: string): ModelPrice {
+  const normalised = model.toLowerCase().trim();
+
+  // 1. Exact match
+  if (normalised in MODEL_PRICES) return MODEL_PRICES[normalised];
+
+  // 2. Prefix match — e.g. "gpt-4o-2024-11-20" → "gpt-4o"
+  for (const key of Object.keys(MODEL_PRICES)) {
+    if (normalised.startsWith(key)) return MODEL_PRICES[key];
+  }
+
+  return UNKNOWN_PRICE;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+export interface CalcCostParams {
+  model:     string;
+  tokensIn:  number;
+  tokensOut: number;
+}
+
+/**
+ * Returns the estimated USD cost for a single LLM call.
+ * Returns 0 for unrecognised models rather than throwing, so the SDK
+ * never crashes user code due to a missing pricing entry.
+ *
+ * @example
+ * calcCostUsd({ model: "gpt-4o", tokensIn: 1000, tokensOut: 500 })
+ * // → 0.00750
+ */
+export function calcCostUsd({ model, tokensIn, tokensOut }: CalcCostParams): number {
+  const price = resolvePrice(model);
+  const inputCost  = (tokensIn  / 1_000_000) * price.inputPer1M;
+  const outputCost = (tokensOut / 1_000_000) * price.outputPer1M;
+  // Round to 8 decimal places to avoid floating-point noise in the DB.
+  return Math.round((inputCost + outputCost) * 1e8) / 1e8;
+}
+
+/**
+ * Formats a USD cost as a human-readable string.
+ * @example formatCost(0.0075) → "$0.0075"
+ * @example formatCost(0.00000120) → "$0.0000012"
+ */
+export function formatCostUsd(usd: number): string {
+  if (usd === 0) return "$0.00";
+  if (usd < 0.0001) return `$${usd.toFixed(8).replace(/0+$/, "")}`;
+  if (usd < 0.01)   return `$${usd.toFixed(6).replace(/0+$/, "")}`;
+  return `$${usd.toFixed(4)}`;
+}
+</file>
+
+<file path="src/wrappers/openai.ts">
+import OpenAI from "openai";
+import type {
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
+  ChatCompletion,
+} from "openai/resources/chat/completions";
+import type { Stream }               from "openai/streaming";
+import type { ChatCompletionChunk }  from "openai/resources";
+import type { Tracer }               from "../core/tracer";
+import type { ChatMessage }          from "../core/types";
+
+type CreateParams =
+  | ChatCompletionCreateParamsNonStreaming
+  | ChatCompletionCreateParamsStreaming;
+
+export function wrapOpenAI(client: OpenAI, tracer: Tracer): OpenAI {
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      if (prop === "chat") {
+        return new Proxy(target.chat, {
+          get(chatTarget, chatProp, chatReceiver) {
+            if (chatProp === "completions") {
+              return new Proxy(chatTarget.completions, {
+                get(compTarget, compProp, compReceiver) {
+                  if (compProp === "create") {
+                    return _makeCreateInterceptor(compTarget, tracer);
+                  }
+                  return Reflect.get(compTarget, compProp, compReceiver);
+                },
+              });
+            }
+            return Reflect.get(chatTarget, chatProp, chatReceiver);
+          },
+        });
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}
+
+function _makeCreateInterceptor(
+  compTarget: OpenAI["chat"]["completions"],
+  tracer: Tracer
+) {
+  async function create(
+    params: ChatCompletionCreateParamsNonStreaming
+  ): Promise<ChatCompletion>;
+  async function create(
+    params: ChatCompletionCreateParamsStreaming
+  ): Promise<Stream<ChatCompletionChunk>>;
+  async function create(params: CreateParams): Promise<unknown> {
+    const startMs = Date.now();
+
+    if (params.stream === true) {
+      let stream: Stream<ChatCompletionChunk>;
+
+      try {
+        stream = await (
+          compTarget.create as (
+            p: ChatCompletionCreateParamsStreaming
+          ) => Promise<Stream<ChatCompletionChunk>>
+        )(params as ChatCompletionCreateParamsStreaming);
+      } catch (err) {
+        tracer.captureAsync({
+          prompt:    params.messages as ChatMessage[],
+          response:  "",
+          model:     params.model,
+          tokensIn:  undefined,
+          tokensOut: undefined,
+          latencyMs: Date.now() - startMs,
+          isStream:  true,
+          error:     err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
+
+      return _wrapStream(stream, params, startMs, tracer);
+    }
+
+    let result: ChatCompletion;
+
+    try {
+      result = await (
+        compTarget.create as (
+          p: ChatCompletionCreateParamsNonStreaming
+        ) => Promise<ChatCompletion>
+      )(params as ChatCompletionCreateParamsNonStreaming);
+    } catch (err) {
+      tracer.captureAsync({
+        prompt:    params.messages as ChatMessage[],
+        response:  "",
+        model:     params.model,
+        tokensIn:  undefined,
+        tokensOut: undefined,
+        latencyMs: Date.now() - startMs,
+        isStream:  false,
+        error:     err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+
+    const latencyMs = Date.now() - startMs;
+
+    tracer.captureAsync({
+      prompt:    params.messages as ChatMessage[],
+      response:  result.choices[0]?.message?.content ?? "",
+      model:     params.model,
+      tokensIn:  result.usage?.prompt_tokens,
+      tokensOut: result.usage?.completion_tokens,
+      latencyMs,
+      isStream:  false,
+    });
+
+    return result;
+  }
+
+  return create;
+}
+
+async function* _wrapStream(
+  stream: Stream<ChatCompletionChunk>,
+  params: CreateParams,
+  startMs: number,
+  tracer: Tracer
+): AsyncGenerator<ChatCompletionChunk> {
+  let fullContent   = "";
+  let chunkCount    = 0;
+  let promptTokens: number | undefined;
+  let caughtError:  Error | undefined;
+
+  try {
+    for await (const chunk of stream) {
+      if (chunk.usage?.prompt_tokens !== undefined) {
+        promptTokens = chunk.usage.prompt_tokens;
+      }
+
+      const delta  = chunk.choices[0]?.delta?.content ?? "";
+      fullContent += delta;
+      chunkCount  += 1;
+
+      yield chunk;
+    }
+  } catch (err) {
+    caughtError = err instanceof Error ? err : new Error(String(err));
+    throw caughtError;
+  } finally {
+    const latencyMs = Date.now() - startMs;
+
+    tracer.captureAsync({
+      prompt:    params.messages as ChatMessage[],
+      response:  fullContent,
+      model:     params.model,
+      tokensIn:  promptTokens,
+      tokensOut: chunkCount,
+      latencyMs,
+      isStream:  true,
+      ...(caughtError ? { error: caughtError.message } : {}),
+    });
+  }
+}
+</file>
+
+<file path="tsconfig.build.json">
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src"]
+}
+</file>
+
+<file path="tsup.config.ts">
+import { defineConfig } from 'tsup';
+
+export default defineConfig({
+  entry:    ['src/index.ts'],
+  format:   ['cjs', 'esm'],
+  dts:      false,
+  clean:    true,
+  tsconfig: 'tsconfig.build.json',
+});
+</file>
+
+</files>

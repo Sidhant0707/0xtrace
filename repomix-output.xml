@@ -45,7 +45,9 @@ The content is organized as follows:
 AGENTS.md
 app/api/cron/drain-queue/route.ts
 app/api/ingest/route.ts
+app/api/prompts/resolve/route.ts
 app/api/replay/route.ts
+app/api/workers/drain/route.ts
 app/auth/callback/route.ts
 app/dashboard/[sessionId]/diff/page.tsx
 app/dashboard/[sessionId]/page.tsx
@@ -56,10 +58,17 @@ app/dashboard/cost/page.tsx
 app/dashboard/explorer/page.tsx
 app/dashboard/layout.tsx
 app/dashboard/page.tsx
+app/dashboard/prompts/[promptId]/page.tsx
+app/dashboard/prompts/[promptId]/VersionManager.tsx
+app/dashboard/prompts/actions.ts
+app/dashboard/prompts/page.tsx
 app/dashboard/settings/actions.ts
 app/dashboard/settings/DeleteProjectButton.tsx
 app/dashboard/settings/KeyManager.tsx
 app/dashboard/settings/page.tsx
+app/dashboard/settings/webhooks/actions.ts
+app/dashboard/settings/webhooks/page.tsx
+app/dashboard/settings/webhooks/WebhookManager.tsx
 app/docs/page.tsx
 app/favicon.ico
 app/globals.css
@@ -93,13 +102,16 @@ components/landing/ProblemSection.tsx
 components/landing/SocialProofBar.tsx
 components/ui/EmptyState.tsx
 eslint.config.mjs
+lib/api-key.ts
 lib/cost.ts
+lib/db.ts
 lib/diff.ts
 lib/project-context.ts
 lib/queries.ts
 lib/supabase-browser.ts
 lib/supabase-server.ts
 lib/supabase.ts
+lib/webhooks.ts
 next.config.ts
 package.json
 packages/sdk/package.json
@@ -117,6 +129,7 @@ PROGRESS.md
 proxy.ts
 README.md
 scripts/test-agent.ts
+scripts/test-ratelimit.ts
 tsconfig.json
 tsconfig.scripts.json
 types/next.ts
@@ -125,6 +138,1784 @@ vercel.json
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="app/api/prompts/resolve/route.ts">
+// app/api/prompts/resolve/route.ts
+
+import { resolveProjectId } from "@/lib/api-key";
+import { supabaseAdmin }    from "@/lib/supabase";
+import { NextRequest, NextResponse } from "next/server";
+
+export async function GET(req: NextRequest): Promise<NextResponse> {
+  const rawKey = req.headers.get("x-api-key");
+  if (!rawKey) {
+    return NextResponse.json({ error: "Missing x-api-key header" }, { status: 401 });
+  }
+
+  const name = req.nextUrl.searchParams.get("name");
+  if (!name) {
+    return NextResponse.json({ error: "Missing ?name query param" }, { status: 400 });
+  }
+
+  const projectId = await resolveProjectId(rawKey);
+  if (!projectId) {
+    return NextResponse.json({ error: "Invalid or revoked API key" }, { status: 401 });
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("prompts")
+    .select("id, name, prompt_versions!inner(content, model, version)")
+    .eq("project_id", projectId)
+    .eq("name", name)
+    .eq("prompt_versions.is_deployed", true)
+    .single();
+
+  if (error || !data) {
+    return NextResponse.json(
+      { error: "Prompt not found or no deployed version" },
+      { status: 404 }
+    );
+  }
+
+  const versions = data.prompt_versions as { content: string; model: string | null; version: string }[];
+
+  return NextResponse.json({
+    name:    data.name,
+    version: versions[0].version,
+    content: versions[0].content,
+    model:   versions[0].model,
+  });
+}
+</file>
+
+<file path="app/api/workers/drain/route.ts">
+// app/api/workers/drain/route.ts
+
+import { verifySignatureAppRouter }  from "@upstash/qstash/nextjs";
+import { Redis }                     from "@upstash/redis";
+import { supabaseAdmin }             from "@/lib/supabase";
+import { computeMessageDiff }        from "@/lib/diff";
+import { calcCostUsd }               from "@/lib/cost";
+import { chunkedInsert }             from "@/lib/db";
+import { dispatchAnomalyWebhooks }   from "@/lib/webhooks";
+import { NextRequest, NextResponse } from "next/server";
+
+export const maxDuration = 60;
+export const dynamic     = "force-dynamic";
+
+const QUEUE_KEY  = "trace:queue";
+const BATCH_SIZE = 200;
+
+const redis = new Redis({
+  url:   process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+interface ChatMessage {
+  role:    "system" | "user" | "assistant" | "tool" | "function";
+  content: string | null;
+  name?:   string;
+}
+
+interface TracePayload {
+  callId:           string;
+  sessionId:        string;
+  stepIndex:        number;
+  timestamp:        string;
+  model:            string;
+  prompt:           ChatMessage[] | readonly ChatMessage[];
+  response:         string;
+  tokensIn:         number | undefined;
+  tokensOut:        number | undefined;
+  latencyMs:        number;
+  isStream:         boolean;
+  estimatedCostUsd: number;
+  sdkVersion:       string;
+  metadata?:        Record<string, unknown>;
+  projectId?:       string;
+}
+
+interface LlmCallRow {
+  call_id:            string;
+  session_id:         string;
+  step_index:         number;
+  model:              string;
+  tokens_in:          number | null;
+  tokens_out:         number | null;
+  latency_ms:         number;
+  estimated_cost_usd: number;
+  is_stream:          boolean;
+  response:           string | null;
+  sdk_version:        string | null;
+  metadata:           Record<string, unknown> | null;
+  timestamp:          string;
+  project_id:         string;
+}
+
+interface SnapshotRow {
+  call_id:            string;
+  session_id:         string;
+  step_index:         number;
+  full_snapshot:      ChatMessage[] | null;
+  diff_from_previous: ReturnType<typeof computeMessageDiff> | null;
+  project_id:         string;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function parseEntry(raw: unknown): TracePayload | null {
+  if (raw !== null && typeof raw === "object") return raw as TracePayload;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw) as TracePayload;
+    } catch {
+      console.warn("[workers/drain] Unparseable payload skipped:", String(raw).slice(0, 120));
+      return null;
+    }
+  }
+  return null;
+}
+
+function toLlmCallRow(t: TracePayload, projectId: string): LlmCallRow {
+  const tokensIn  = t.tokensIn  ?? null;
+  const tokensOut = t.tokensOut ?? null;
+
+  return {
+    call_id:            t.callId,
+    session_id:         t.sessionId,
+    step_index:         t.stepIndex,
+    model:              t.model,
+    tokens_in:          tokensIn,
+    tokens_out:         tokensOut,
+    latency_ms:         t.latencyMs,
+    estimated_cost_usd: calcCostUsd({
+      model:     t.model,
+      tokensIn:  tokensIn  ?? 0,
+      tokensOut: tokensOut ?? 0,
+    }),
+    is_stream:   t.isStream,
+    response:    t.response   ?? null,
+    sdk_version: t.sdkVersion ?? null,
+    metadata:    t.metadata   ?? null,
+    timestamp:   t.timestamp,
+    project_id:  projectId,
+  };
+}
+
+// ── Handler ───────────────────────────────────────────────────────────────────
+// verifySignatureAppRouter wraps the handler and rejects any POST that does
+// not carry a valid QStash HMAC signature — the route cannot be triggered
+// publicly even if its URL is known.
+
+async function handler(_req: NextRequest): Promise<NextResponse> {
+  // ── 1. Atomic batch pop ───────────────────────────────────────────────────
+  const rawBatch = await redis.lpop<unknown>(QUEUE_KEY, BATCH_SIZE);
+
+  if (!rawBatch) {
+    return NextResponse.json({ ok: true, processed: 0, message: "Queue empty" });
+  }
+
+  const rawArray: unknown[] = Array.isArray(rawBatch) ? rawBatch : [rawBatch];
+
+  // ── 2. Parse ──────────────────────────────────────────────────────────────
+  const allTraces = rawArray
+    .map(parseEntry)
+    .filter((t): t is TracePayload => t !== null);
+
+  // ── 3. Drop orphaned traces (no project_id) ───────────────────────────────
+  const orphaned = allTraces.filter((t) => !t.projectId);
+  if (orphaned.length > 0) {
+    console.warn(`[workers/drain] Skipping ${orphaned.length} orphaned trace(s).`);
+  }
+
+  const traces = allTraces.filter(
+    (t): t is TracePayload & { projectId: string } =>
+      typeof t.projectId === "string" && t.projectId.length > 0
+  );
+
+  if (traces.length === 0) {
+    return NextResponse.json({ ok: true, processed: 0, message: "No valid traces." });
+  }
+
+  // ── 4. Insert llm_calls ───────────────────────────────────────────────────
+  const llmCallRows = traces.map((t) => toLlmCallRow(t, t.projectId));
+
+  try {
+    await chunkedInsert("llm_calls", llmCallRows);
+  } catch (err) {
+    console.error("[workers/drain] llm_calls insert failed:", err);
+    return NextResponse.json({ ok: false, error: String(err) }, { status: 500 });
+  }
+
+  // ── 5. Build within-batch prompt cache ───────────────────────────────────
+  const promptCache = new Map<string, ChatMessage[]>();
+  for (const trace of traces) {
+    promptCache.set(
+      `${trace.sessionId}:${trace.stepIndex}`,
+      [...trace.prompt] as ChatMessage[]
+    );
+  }
+
+  // ── 6. Sort by session + step ─────────────────────────────────────────────
+  const sorted = [...traces].sort(
+    (a, b) => a.sessionId.localeCompare(b.sessionId) || a.stepIndex - b.stepIndex
+  );
+
+  // ── 7. Build snapshot rows ────────────────────────────────────────────────
+  const snapshotRows: SnapshotRow[] = [];
+
+  for (const trace of sorted) {
+    const projectId = trace.projectId;
+
+    if (trace.stepIndex === 1) {
+      snapshotRows.push({
+        call_id:            trace.callId,
+        session_id:         trace.sessionId,
+        step_index:         1,
+        full_snapshot:      [...trace.prompt] as ChatMessage[],
+        diff_from_previous: null,
+        project_id:         projectId,
+      });
+      continue;
+    }
+
+    const prevKey    = `${trace.sessionId}:${trace.stepIndex - 1}`;
+    let prevMessages = promptCache.get(prevKey);
+
+    if (!prevMessages) {
+      const { data } = await supabaseAdmin
+        .from("prompt_snapshots")
+        .select("full_snapshot")
+        .eq("session_id", trace.sessionId)
+        .eq("step_index", trace.stepIndex - 1)
+        .eq("project_id", projectId)
+        .single();
+
+      if (data?.full_snapshot) {
+        prevMessages = data.full_snapshot as ChatMessage[];
+      }
+    }
+
+    if (prevMessages) {
+      snapshotRows.push({
+        call_id:            trace.callId,
+        session_id:         trace.sessionId,
+        step_index:         trace.stepIndex,
+        full_snapshot:      null,
+        diff_from_previous: computeMessageDiff(
+          prevMessages,
+          [...trace.prompt] as ChatMessage[]
+        ),
+        project_id: projectId,
+      });
+    } else {
+      console.warn(
+        `[workers/drain] prev snapshot not found — ` +
+        `session=${trace.sessionId} step=${trace.stepIndex - 1}. Fallback to full snapshot.`
+      );
+      snapshotRows.push({
+        call_id:            trace.callId,
+        session_id:         trace.sessionId,
+        step_index:         trace.stepIndex,
+        full_snapshot:      [...trace.prompt] as ChatMessage[],
+        diff_from_previous: null,
+        project_id:         projectId,
+      });
+    }
+  }
+
+  // ── 8. Insert prompt_snapshots ────────────────────────────────────────────
+  if (snapshotRows.length > 0) {
+    try {
+      await chunkedInsert("prompt_snapshots", snapshotRows);
+    } catch (err) {
+      console.error("[workers/drain] prompt_snapshots insert failed:", err);
+      return NextResponse.json({ ok: false, error: String(err) }, { status: 500 });
+    }
+  }
+
+  await dispatchAnomalyWebhooks(traces);
+
+  return NextResponse.json({ ok: true, processed: traces.length });
+}
+
+export const POST = verifySignatureAppRouter(handler);
+</file>
+
+<file path="app/dashboard/prompts/[promptId]/page.tsx">
+// app/dashboard/prompts/[promptId]/page.tsx
+
+import type { Metadata } from "next";
+import Link from "next/link";
+import { redirect, notFound } from "next/navigation";
+import { createClient } from "@/lib/supabase-server";
+import { supabaseAdmin } from "@/lib/supabase";
+import { getActiveProject } from "@/lib/project-context";
+import { VersionManager } from "./VersionManager";
+
+export const metadata: Metadata = { title: "Prompt Versions" };
+
+async function getPromptWithVersions(promptId: string, projectId: string) {
+  const { data } = await supabaseAdmin
+    .from("prompts")
+    .select(
+      "id, name, description, health_score, prompt_versions(id, version, content, model, is_deployed, created_at)",
+    )
+    .eq("id", projectId ? promptId : promptId)
+    .eq("project_id", projectId)
+    .order("created_at", {
+      referencedTable: "prompt_versions",
+      ascending: false,
+    })
+    .single();
+  return data;
+}
+
+export default async function PromptDetailPage({
+  params,
+}: {
+  params: Promise<{ promptId: string }>;
+}) {
+  const { promptId } = await params;
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  const project = await getActiveProject();
+  if (!project) redirect("/onboarding");
+
+  const prompt = await getPromptWithVersions(promptId, project.id);
+  if (!prompt) notFound();
+
+  const sdkSnippet = `const content = await tracer.getPrompt("${prompt.name}");`;
+
+  return (
+    <div>
+      <div className="mb-8">
+        <Link
+          href="/dashboard/prompts"
+          className="text-[#52525b] text-sm hover:text-[#71717a] transition-colors"
+        >
+          ← Prompt Registry
+        </Link>
+        <h1 className="mt-2 m-0 text-white text-2xl font-medium leading-tight tracking-[-0.02em]">
+          {prompt.name}
+        </h1>
+        {prompt.description && (
+          <p className="mt-1.5 text-[#71717a] text-sm m-0">
+            {prompt.description}
+          </p>
+        )}
+      </div>
+
+      <div className="mb-6 bg-[#111] border border-[#1f1f1f] rounded-lg px-4 md:px-6 py-4">
+        <p className="text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-2">
+          SDK Usage
+        </p>
+        <pre className="text-[12px] text-emerald-400 overflow-x-auto">
+          {sdkSnippet}
+        </pre>
+      </div>
+
+      <VersionManager
+        promptId={prompt.id}
+        versions={
+          prompt.prompt_versions as Parameters<
+            typeof VersionManager
+          >[0]["versions"]
+        }
+      />
+    </div>
+  );
+}
+</file>
+
+<file path="app/dashboard/prompts/[promptId]/VersionManager.tsx">
+// app/dashboard/prompts/[promptId]/VersionManager.tsx
+
+"use client";
+
+import { useState, useTransition } from "react";
+import { createVersion, deployVersion, deleteVersion } from "../actions";
+
+interface VersionRow {
+  id: string;
+  version: string;
+  content: string;
+  model: string | null;
+  is_deployed: boolean;
+  created_at: string;
+}
+
+interface Props {
+  promptId: string;
+  versions: VersionRow[];
+}
+
+export function VersionManager({ promptId, versions }: Props) {
+  const [isPending, startTransition] = useTransition();
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  function handleDeploy(versionId: string) {
+    startTransition(() => {
+      deployVersion(promptId, versionId);
+    });
+  }
+
+  function handleDelete(versionId: string) {
+    startTransition(() => {
+      deleteVersion(promptId, versionId);
+    });
+  }
+
+  return (
+    <div className="space-y-6">
+      <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
+        <div className="px-4 md:px-6 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a]">
+          <h2 className="text-white text-[14px] font-medium m-0">
+            Versions
+            <span className="ml-2 text-[#52525b] font-normal">
+              ({versions.length})
+            </span>
+          </h2>
+        </div>
+
+        {versions.length === 0 ? (
+          <div className="px-6 py-12 text-center text-[#52525b] text-sm">
+            No versions yet. Create the first one below.
+          </div>
+        ) : (
+          <div className="divide-y divide-[#1f1f1f]">
+            {versions.map((v) => (
+              <div key={v.id} className="px-4 md:px-6 py-4">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-2.5 flex-wrap">
+                    <span className="text-white text-sm font-medium">
+                      v{v.version}
+                    </span>
+                    {v.model && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#1f1f1f] text-[#71717a]">
+                        {v.model}
+                      </span>
+                    )}
+                    {v.is_deployed && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                        deployed
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={() =>
+                        setExpanded(expanded === v.id ? null : v.id)
+                      }
+                      className="text-[11px] text-[#71717a] hover:text-white transition-colors"
+                    >
+                      {expanded === v.id ? "Hide" : "View"}
+                    </button>
+                    {!v.is_deployed && (
+                      <button
+                        onClick={() => handleDeploy(v.id)}
+                        disabled={isPending}
+                        className="text-[11px] text-[#a1a1aa] hover:text-emerald-400 disabled:opacity-40 transition-colors"
+                      >
+                        Deploy
+                      </button>
+                    )}
+                    <button
+                      onClick={() => handleDelete(v.id)}
+                      disabled={isPending || v.is_deployed}
+                      className="text-[11px] text-[#52525b] hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+
+                {expanded === v.id && (
+                  <pre className="mt-3 p-3 bg-[#0a0a0a] border border-[#1f1f1f] rounded text-[12px] text-[#a1a1aa] overflow-x-auto whitespace-pre-wrap break-words">
+                    {v.content}
+                  </pre>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
+        <div className="px-4 md:px-6 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a]">
+          <h2 className="text-white text-[14px] font-medium m-0">
+            Add Version
+          </h2>
+        </div>
+        <form
+          action={async (formData) => {
+            formData.set("prompt_id", promptId);
+            startTransition(() => {
+              createVersion(formData);
+            });
+          }}
+          className="px-4 md:px-6 py-5 space-y-4"
+        >
+          <input type="hidden" name="prompt_id" value={promptId} />
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-1.5">
+                Version
+              </label>
+              <input
+                name="version"
+                required
+                placeholder="e.g. 1.0"
+                className="w-full bg-[#0a0a0a] border border-[#1f1f1f] rounded px-3 py-2 text-white text-sm placeholder-[#3f3f46] focus:outline-none focus:border-[#3f3f46]"
+              />
+            </div>
+            <div>
+              <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-1.5">
+                Model (optional)
+              </label>
+              <input
+                name="model"
+                placeholder="e.g. gpt-4o-mini"
+                className="w-full bg-[#0a0a0a] border border-[#1f1f1f] rounded px-3 py-2 text-white text-sm placeholder-[#3f3f46] focus:outline-none focus:border-[#3f3f46]"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-1.5">
+              Prompt Content
+            </label>
+            <textarea
+              name="content"
+              required
+              rows={8}
+              placeholder="You are a helpful assistant..."
+              className="w-full bg-[#0a0a0a] border border-[#1f1f1f] rounded px-3 py-2 text-white text-sm placeholder-[#3f3f46] focus:outline-none focus:border-[#3f3f46] resize-y font-mono"
+            />
+          </div>
+
+          <button
+            type="submit"
+            disabled={isPending}
+            className="w-full sm:w-auto px-5 py-2 bg-white text-black text-sm font-medium rounded hover:bg-[#e5e5e5] disabled:opacity-40 transition-colors"
+          >
+            {isPending ? "Saving…" : "Save Version"}
+          </button>
+        </form>
+      </section>
+    </div>
+  );
+}
+</file>
+
+<file path="app/dashboard/prompts/actions.ts">
+// app/dashboard/prompts/actions.ts
+
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { redirect }       from "next/navigation";
+import { createClient }   from "@/lib/supabase-server";
+import { supabaseAdmin }  from "@/lib/supabase";
+import { getActiveProject } from "@/lib/project-context";
+
+export async function createPrompt(formData: FormData): Promise<void> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  const project = await getActiveProject();
+  if (!project) redirect("/onboarding");
+
+  const name        = (formData.get("name")        as string).trim();
+  const description = (formData.get("description") as string | null)?.trim() ?? null;
+
+  if (!name) return;
+
+  await supabaseAdmin.from("prompts").insert({
+    project_id: project.id,
+    name,
+    description,
+  });
+
+  revalidatePath("/dashboard/prompts");
+}
+
+export async function deletePrompt(promptId: string): Promise<void> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  await supabaseAdmin.from("prompts").delete().eq("id", promptId);
+
+  revalidatePath("/dashboard/prompts");
+}
+
+export async function createVersion(formData: FormData): Promise<void> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  const promptId = formData.get("prompt_id") as string;
+  const version  = (formData.get("version")  as string).trim();
+  const content  = (formData.get("content")  as string).trim();
+  const model    = (formData.get("model")    as string | null)?.trim() ?? null;
+
+  if (!promptId || !version || !content) return;
+
+  await supabaseAdmin.from("prompt_versions").insert({
+    prompt_id: promptId,
+    version,
+    content,
+    model,
+  });
+
+  revalidatePath(`/dashboard/prompts/${promptId}`);
+}
+
+export async function deployVersion(
+  promptId:  string,
+  versionId: string,
+): Promise<void> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  await supabaseAdmin
+    .from("prompt_versions")
+    .update({ is_deployed: false })
+    .eq("prompt_id", promptId);
+
+  await supabaseAdmin
+    .from("prompt_versions")
+    .update({ is_deployed: true })
+    .eq("id", versionId);
+
+  revalidatePath(`/dashboard/prompts/${promptId}`);
+}
+
+export async function deleteVersion(
+  promptId:  string,
+  versionId: string,
+): Promise<void> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  await supabaseAdmin.from("prompt_versions").delete().eq("id", versionId);
+
+  revalidatePath(`/dashboard/prompts/${promptId}`);
+}
+</file>
+
+<file path="app/dashboard/prompts/page.tsx">
+// app/dashboard/prompts/page.tsx
+
+import type { Metadata } from "next";
+import Link from "next/link";
+import { redirect } from "next/navigation";
+import { createClient } from "@/lib/supabase-server";
+import { supabaseAdmin } from "@/lib/supabase";
+import { getActiveProject } from "@/lib/project-context";
+import { createPrompt, deletePrompt } from "./actions";
+
+export const metadata: Metadata = { title: "Prompt Registry" };
+
+interface PromptRow {
+  id: string;
+  name: string;
+  description: string | null;
+  health_score: number;
+  created_at: string;
+  prompt_versions: { version: string; is_deployed: boolean }[];
+}
+
+async function getPrompts(projectId: string): Promise<PromptRow[]> {
+  const { data } = await supabaseAdmin
+    .from("prompts")
+    .select(
+      "id, name, description, health_score, created_at, prompt_versions(version, is_deployed)",
+    )
+    .eq("project_id", projectId)
+    .order("created_at", { ascending: false });
+  return (data ?? []) as PromptRow[];
+}
+
+function HealthBadge({ score }: { score: number }) {
+  const color =
+    score >= 80
+      ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/20"
+      : score >= 50
+        ? "text-yellow-400 bg-yellow-500/10 border-yellow-500/20"
+        : "text-red-400 bg-red-500/10 border-red-500/20";
+
+  return (
+    <span
+      className={`text-[11px] px-2 py-0.5 rounded border font-medium ${color}`}
+    >
+      {score.toFixed(0)}
+    </span>
+  );
+}
+
+export default async function PromptsPage() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  const project = await getActiveProject();
+  if (!project) redirect("/onboarding");
+
+  const prompts = await getPrompts(project.id);
+
+  return (
+    <div>
+      <div className="mb-8">
+        <h1 className="m-0 text-white text-2xl font-medium leading-tight tracking-[-0.02em]">
+          Prompt Registry
+        </h1>
+        <p className="mt-1.5 text-[#71717a] text-sm m-0">
+          {project.name} · Version and deploy prompts. Fetch them at runtime via
+          the SDK.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-6">
+        <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
+          <div className="px-4 md:px-6 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a] flex items-center justify-between">
+            <h2 className="text-white text-[14px] font-medium m-0">
+              Prompts
+              <span className="ml-2 text-[#52525b] font-normal">
+                ({prompts.length})
+              </span>
+            </h2>
+          </div>
+
+          {prompts.length === 0 ? (
+            <div className="px-6 py-12 text-center text-[#52525b] text-sm">
+              No prompts yet. Create one to get started.
+            </div>
+          ) : (
+            <div className="divide-y divide-[#1f1f1f]">
+              {prompts.map((p) => {
+                const deployed = p.prompt_versions.find((v) => v.is_deployed);
+                return (
+                  <div
+                    key={p.id}
+                    className="flex items-center justify-between gap-4 px-4 md:px-6 py-4 hover:bg-[#0a0a0a] transition-colors"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <Link
+                          href={`/dashboard/prompts/${p.id}`}
+                          className="text-white text-sm font-medium hover:text-[#a1a1aa] transition-colors"
+                        >
+                          {p.name}
+                        </Link>
+                        {deployed && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#1f1f1f] text-[#71717a]">
+                            v{deployed.version}
+                          </span>
+                        )}
+                      </div>
+                      {p.description && (
+                        <p className="text-[#52525b] text-[12px] mt-0.5 truncate">
+                          {p.description}
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-3 shrink-0">
+                      <HealthBadge score={p.health_score} />
+                      <form action={deletePrompt.bind(null, p.id)}>
+                        <button
+                          type="submit"
+                          className="text-[11px] text-[#52525b] hover:text-red-400 transition-colors"
+                        >
+                          Delete
+                        </button>
+                      </form>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden h-fit">
+          <div className="px-4 md:px-6 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a]">
+            <h2 className="text-white text-[14px] font-medium m-0">
+              New Prompt
+            </h2>
+          </div>
+          <form action={createPrompt} className="px-4 md:px-6 py-5 space-y-4">
+            <div>
+              <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-1.5">
+                Name
+              </label>
+              <input
+                name="name"
+                required
+                placeholder="e.g. customer_support_agent"
+                className="w-full bg-[#0a0a0a] border border-[#1f1f1f] rounded px-3 py-2 text-white text-sm placeholder-[#3f3f46] focus:outline-none focus:border-[#3f3f46]"
+              />
+            </div>
+            <div>
+              <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-1.5">
+                Description
+              </label>
+              <input
+                name="description"
+                placeholder="Optional"
+                className="w-full bg-[#0a0a0a] border border-[#1f1f1f] rounded px-3 py-2 text-white text-sm placeholder-[#3f3f46] focus:outline-none focus:border-[#3f3f46]"
+              />
+            </div>
+            <button
+              type="submit"
+              className="w-full px-4 py-2 bg-white text-black text-sm font-medium rounded hover:bg-[#e5e5e5] transition-colors"
+            >
+              Create Prompt
+            </button>
+          </form>
+        </section>
+      </div>
+    </div>
+  );
+}
+</file>
+
+<file path="app/dashboard/settings/webhooks/actions.ts">
+// app/dashboard/settings/webhooks/actions.ts
+
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { redirect }       from "next/navigation";
+import { createClient }   from "@/lib/supabase-server";
+import { supabaseAdmin }  from "@/lib/supabase";
+import { getActiveProject } from "@/lib/project-context";
+import type { WebhookTrigger, WebhookProvider } from "@/lib/webhooks";
+
+export async function createWebhook(formData: FormData): Promise<void> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  const project = await getActiveProject();
+  if (!project) redirect("/onboarding");
+
+  const name     = formData.get("name") as string;
+  const url      = formData.get("url")  as string;
+  const provider = formData.get("provider") as WebhookProvider;
+  const triggers = formData.getAll("triggers") as WebhookTrigger[];
+
+  if (!name || !url || !provider || triggers.length === 0) return;
+
+  await supabaseAdmin.from("webhook_configs").insert({
+    project_id: project.id,
+    name,
+    url,
+    provider,
+    triggers,
+  });
+
+  revalidatePath("/dashboard/settings/webhooks");
+}
+
+export async function deleteWebhook(webhookId: string): Promise<void> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  await supabaseAdmin
+    .from("webhook_configs")
+    .delete()
+    .eq("id", webhookId);
+
+  revalidatePath("/dashboard/settings/webhooks");
+}
+
+export async function toggleWebhook(
+  webhookId: string,
+  isActive:  boolean,
+): Promise<void> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  await supabaseAdmin
+    .from("webhook_configs")
+    .update({ is_active: isActive })
+    .eq("id", webhookId);
+
+  revalidatePath("/dashboard/settings/webhooks");
+}
+</file>
+
+<file path="app/dashboard/settings/webhooks/page.tsx">
+// app/dashboard/settings/webhooks/page.tsx
+
+import type { Metadata } from "next";
+import { redirect } from "next/navigation";
+import { createClient } from "@/lib/supabase-server";
+import { supabaseAdmin } from "@/lib/supabase";
+import { getActiveProject } from "@/lib/project-context";
+import { WebhookManager } from "./WebhookManager";
+
+export const metadata: Metadata = { title: "Webhooks" };
+
+async function getWebhooks(projectId: string) {
+  const { data } = await supabaseAdmin
+    .from("webhook_configs")
+    .select("*")
+    .eq("project_id", projectId)
+    .order("created_at", { ascending: false });
+  return data ?? [];
+}
+
+async function getDeliveries(projectId: string) {
+  const { data } = await supabaseAdmin
+    .from("webhook_deliveries")
+    .select(
+      "webhook_configs!inner(project_id), id, webhook_id, trigger_type, status, response_code, response_body, delivered_at, created_at",
+    )
+    .eq("webhook_configs.project_id", projectId)
+    .order("created_at", { ascending: false })
+    .limit(50);
+  return (data ?? []).map(({ webhook_configs: _wc, ...rest }) => rest);
+}
+
+export default async function WebhooksPage() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  const project = await getActiveProject();
+  if (!project) redirect("/onboarding");
+
+  const [webhooks, deliveries] = await Promise.all([
+    getWebhooks(project.id),
+    getDeliveries(project.id),
+  ]);
+
+  return (
+    <div>
+      <div className="mb-8">
+        <h1 className="m-0 text-white text-2xl font-medium leading-tight tracking-[-0.02em]">
+          Webhooks
+        </h1>
+        <p className="mt-1.5 text-[#71717a] text-sm m-0">
+          {project.name} · Real-time anomaly alerts for Slack, Discord, or any
+          HTTP endpoint
+        </p>
+      </div>
+
+      <WebhookManager
+        webhooks={webhooks as Parameters<typeof WebhookManager>[0]["webhooks"]}
+        deliveries={
+          deliveries as Parameters<typeof WebhookManager>[0]["deliveries"]
+        }
+      />
+    </div>
+  );
+}
+</file>
+
+<file path="app/dashboard/settings/webhooks/WebhookManager.tsx">
+// app/dashboard/settings/webhooks/WebhookManager.tsx
+
+"use client";
+
+import { useState, useTransition } from "react";
+import { createWebhook, deleteWebhook, toggleWebhook } from "./actions";
+import type { WebhookTrigger, WebhookProvider } from "@/lib/webhooks";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+interface WebhookRow {
+  id: string;
+  name: string;
+  url: string;
+  provider: WebhookProvider;
+  triggers: WebhookTrigger[];
+  is_active: boolean;
+  created_at: string;
+}
+
+interface DeliveryRow {
+  id: string;
+  webhook_id: string;
+  trigger_type: string;
+  status: "pending" | "delivered" | "failed";
+  response_code: number | null;
+  response_body: string | null;
+  delivered_at: string | null;
+  created_at: string;
+}
+
+interface Props {
+  webhooks: WebhookRow[];
+  deliveries: DeliveryRow[];
+}
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const TRIGGER_OPTIONS: { value: WebhookTrigger; label: string }[] = [
+  { value: "explicit", label: "SDK-flagged anomaly" },
+  { value: "high_latency", label: "High latency (>10s)" },
+  { value: "token_explosion", label: "Token explosion" },
+  { value: "cost_spike", label: "Cost spike" },
+];
+
+const PROVIDER_OPTIONS: { value: WebhookProvider; label: string }[] = [
+  { value: "slack", label: "Slack" },
+  { value: "discord", label: "Discord" },
+  { value: "generic", label: "Generic (JSON POST)" },
+];
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+function StatusBadge({ status }: { status: DeliveryRow["status"] }) {
+  const styles: Record<DeliveryRow["status"], string> = {
+    delivered: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+    failed: "bg-red-500/10    text-red-400    border-red-500/20",
+    pending: "bg-yellow-500/10 text-yellow-400 border-yellow-500/20",
+  };
+  return (
+    <span
+      className={`text-[11px] px-2 py-0.5 rounded border ${styles[status]}`}
+    >
+      {status}
+    </span>
+  );
+}
+
+function WebhookCard({
+  webhook,
+  onDelete,
+  onToggle,
+}: {
+  webhook: WebhookRow;
+  onDelete: (id: string) => void;
+  onToggle: (id: string, active: boolean) => void;
+}) {
+  return (
+    <div className="bg-[#0a0a0a] border border-[#1f1f1f] rounded-lg p-4 flex flex-col gap-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-white text-sm font-medium truncate">
+            {webhook.name}
+          </p>
+          <p className="text-[#52525b] text-[11px] truncate mt-0.5">
+            {webhook.url}
+          </p>
+        </div>
+        <span className="shrink-0 text-[11px] px-2 py-0.5 rounded border border-[#1f1f1f] text-[#71717a]">
+          {webhook.provider}
+        </span>
+      </div>
+
+      <div className="flex flex-wrap gap-1.5">
+        {webhook.triggers.map((t) => (
+          <span
+            key={t}
+            className="text-[10px] px-1.5 py-0.5 rounded bg-[#1f1f1f] text-[#a1a1aa]"
+          >
+            {t.replace(/_/g, " ")}
+          </span>
+        ))}
+      </div>
+
+      <div className="flex items-center justify-between pt-1 border-t border-[#1f1f1f]">
+        <button
+          onClick={() => onToggle(webhook.id, !webhook.is_active)}
+          className={`text-[11px] font-medium transition-colors ${
+            webhook.is_active
+              ? "text-emerald-400 hover:text-emerald-300"
+              : "text-[#52525b] hover:text-[#71717a]"
+          }`}
+        >
+          {webhook.is_active ? "● Active" : "○ Disabled"}
+        </button>
+        <button
+          onClick={() => onDelete(webhook.id)}
+          className="text-[11px] text-[#52525b] hover:text-red-400 transition-colors"
+        >
+          Delete
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
+
+export function WebhookManager({ webhooks, deliveries }: Props) {
+  const [isPending, startTransition] = useTransition();
+  const [selectedTriggers, setSelectedTriggers] = useState<WebhookTrigger[]>(
+    [],
+  );
+
+  function handleDelete(id: string) {
+    startTransition(() => {
+      deleteWebhook(id);
+    });
+  }
+
+  function handleToggle(id: string, active: boolean) {
+    startTransition(() => {
+      toggleWebhook(id, active);
+    });
+  }
+
+  function handleTriggerToggle(trigger: WebhookTrigger) {
+    setSelectedTriggers((prev) =>
+      prev.includes(trigger)
+        ? prev.filter((t) => t !== trigger)
+        : [...prev, trigger],
+    );
+  }
+
+  async function handleSubmit(formData: FormData) {
+    selectedTriggers.forEach((t) => formData.append("triggers", t));
+    setSelectedTriggers([]);
+    startTransition(() => {
+      createWebhook(formData);
+    });
+  }
+
+  return (
+    <div className="space-y-8">
+      <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
+        <div className="px-4 md:px-6 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a]">
+          <h2 className="text-white text-[14px] font-medium m-0">
+            Add Webhook
+          </h2>
+          <p className="text-[#71717a] text-[12px] mt-1 m-0">
+            Receive real-time alerts when anomalies are detected in your traces.
+          </p>
+        </div>
+
+        <form action={handleSubmit} className="px-4 md:px-6 py-5 space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-1.5">
+                Name
+              </label>
+              <input
+                name="name"
+                required
+                placeholder="e.g. Prod Alerts"
+                className="w-full bg-[#0a0a0a] border border-[#1f1f1f] rounded px-3 py-2 text-white text-sm placeholder-[#3f3f46] focus:outline-none focus:border-[#3f3f46]"
+              />
+            </div>
+            <div>
+              <label
+                htmlFor="provider"
+                className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-1.5"
+              >
+                Provider
+              </label>
+              <select
+                id="provider"
+                name="provider"
+                required
+                title="Provider"
+                aria-label="Provider"
+                className="w-full bg-[#0a0a0a] border border-[#1f1f1f] rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-[#3f3f46]"
+              >
+                {PROVIDER_OPTIONS.map((p) => (
+                  <option key={p.value} value={p.value}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-1.5">
+              Webhook URL
+            </label>
+            <input
+              name="url"
+              type="url"
+              required
+              placeholder="https://hooks.slack.com/services/..."
+              className="w-full bg-[#0a0a0a] border border-[#1f1f1f] rounded px-3 py-2 text-white text-sm placeholder-[#3f3f46] focus:outline-none focus:border-[#3f3f46]"
+            />
+          </div>
+
+          <div>
+            <label className="block text-[#a1a1aa] text-[11px] uppercase tracking-[0.05em] mb-2">
+              Triggers
+            </label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {TRIGGER_OPTIONS.map((opt) => (
+                <label
+                  key={opt.value}
+                  className="flex items-center gap-2.5 cursor-pointer group"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedTriggers.includes(opt.value)}
+                    onChange={() => handleTriggerToggle(opt.value)}
+                    className="accent-white"
+                  />
+                  <span className="text-[#a1a1aa] text-sm group-hover:text-white transition-colors">
+                    {opt.label}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={isPending || selectedTriggers.length === 0}
+            className="w-full sm:w-auto px-5 py-2 bg-white text-black text-sm font-medium rounded hover:bg-[#e5e5e5] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            {isPending ? "Saving…" : "Add Webhook"}
+          </button>
+        </form>
+      </section>
+
+      {webhooks.length > 0 && (
+        <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
+          <div className="px-4 md:px-6 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a]">
+            <h2 className="text-white text-[14px] font-medium m-0">
+              Configured Webhooks
+              <span className="ml-2 text-[#52525b] font-normal">
+                ({webhooks.length})
+              </span>
+            </h2>
+          </div>
+          <div className="p-4 md:p-6 grid grid-cols-1 md:grid-cols-2 gap-3">
+            {webhooks.map((w) => (
+              <WebhookCard
+                key={w.id}
+                webhook={w}
+                onDelete={handleDelete}
+                onToggle={handleToggle}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {deliveries.length > 0 && (
+        <section className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
+          <div className="px-4 md:px-6 py-4 border-b border-[#1f1f1f] bg-[#0a0a0a]">
+            <h2 className="text-white text-[14px] font-medium m-0">
+              Delivery Log
+            </h2>
+            <p className="text-[#71717a] text-[12px] mt-1 m-0">
+              Last 50 webhook delivery attempts.
+            </p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-[#1f1f1f]">
+                  {[
+                    "Trigger",
+                    "Status",
+                    "HTTP",
+                    "Response",
+                    "Delivered At",
+                  ].map((h) => (
+                    <th
+                      key={h}
+                      className="px-4 md:px-6 py-3 text-left text-[11px] text-[#52525b] uppercase tracking-[0.05em] font-medium whitespace-nowrap"
+                    >
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {deliveries.map((d) => (
+                  <tr
+                    key={d.id}
+                    className="border-b border-[#1f1f1f] last:border-0 hover:bg-[#0a0a0a]"
+                  >
+                    <td className="px-4 md:px-6 py-3 text-[#a1a1aa] whitespace-nowrap">
+                      {d.trigger_type.replace(/_/g, " ")}
+                    </td>
+                    <td className="px-4 md:px-6 py-3 whitespace-nowrap">
+                      <StatusBadge status={d.status} />
+                    </td>
+                    <td className="px-4 md:px-6 py-3 text-[#71717a] whitespace-nowrap">
+                      {d.response_code ?? "—"}
+                    </td>
+                    <td className="px-4 md:px-6 py-3 text-[#52525b] max-w-[200px] truncate">
+                      {d.response_body ?? "—"}
+                    </td>
+                    <td className="px-4 md:px-6 py-3 text-[#52525b] whitespace-nowrap">
+                      {d.delivered_at
+                        ? new Date(d.delivered_at).toLocaleString()
+                        : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+</file>
+
+<file path="lib/api-key.ts">
+// lib/api-key.ts
+
+import { supabaseAdmin } from "@/lib/supabase";
+
+async function hashApiKey(plainKey: string): Promise<string> {
+  const encoded = new TextEncoder().encode(plainKey);
+  const hashBuf = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(hashBuf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export async function resolveProjectId(plainKey: string): Promise<string | null> {
+  const keyHash = await hashApiKey(plainKey);
+
+  const { data, error } = await supabaseAdmin
+    .from("api_keys")
+    .select("project_id, is_active")
+    .eq("key_hash", keyHash)
+    .single();
+
+  if (error || !data || data.is_active === false) return null;
+
+  supabaseAdmin
+    .from("api_keys")
+    .update({ last_used_at: new Date().toISOString() })
+    .eq("key_hash", keyHash)
+    .then(() => {});
+
+  return data.project_id as string;
+}
+</file>
+
+<file path="lib/db.ts">
+// lib/db.ts
+
+import { supabaseAdmin } from "@/lib/supabase";
+
+const CHUNK_SIZE = 50;
+
+// Supabase (PostgREST) serialises every row field as a query parameter.
+// A single .insert() of 500 rows with 15 columns = 7,500 parameters —
+// well within the 65,535 PostgreSQL limit today, but a single infinite
+// agent loop can push thousands of traces in one drain cycle.
+// Chunking at 50 rows keeps parameter counts safely bounded regardless
+// of payload size or future schema additions.
+
+export async function chunkedInsert<T extends object>(
+  table: string,
+  rows:  T[],
+): Promise<void> {
+  for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+    const chunk = rows.slice(i, i + CHUNK_SIZE);
+
+    const { error } = await supabaseAdmin.from(table).insert(chunk);
+
+    if (error) {
+      throw new Error(
+        `[chunkedInsert] table="${table}" chunk=${Math.floor(i / CHUNK_SIZE)} — ${error.message}`
+      );
+    }
+  }
+}
+</file>
+
+<file path="lib/webhooks.ts">
+// lib/webhooks.ts
+
+import { supabaseAdmin } from "@/lib/supabase";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export type WebhookTrigger =
+  | "explicit"
+  | "high_latency"
+  | "token_explosion"
+  | "cost_spike";
+
+export type WebhookProvider = "slack" | "discord" | "generic";
+
+export interface WebhookConfig {
+  id:         string;
+  project_id: string;
+  name:       string;
+  url:        string;
+  provider:   WebhookProvider;
+  triggers:   WebhookTrigger[];
+  is_active:  boolean;
+}
+
+export interface AnomalyEvent {
+  type:        WebhookTrigger;
+  severity:    "critical" | "warning";
+  projectId:   string;
+  sessionId:   string;
+  description: string;
+  detectedAt:  string;
+  meta:        Record<string, unknown>;
+}
+
+interface TracePayload {
+  callId:           string;
+  sessionId:        string;
+  stepIndex:        number;
+  timestamp:        string;
+  model:            string;
+  tokensIn?:        number;
+  latencyMs:        number;
+  estimatedCostUsd: number;
+  metadata?:        Record<string, unknown>;
+  projectId:        string;
+}
+
+// ── Thresholds ────────────────────────────────────────────────────────────────
+
+const HIGH_LATENCY_MS      = 10_000;
+const TOKEN_EXPLOSION_LIMIT = 50_000;
+const COST_SPIKE_USD        = 0.10;
+
+// ── Anomaly detection ─────────────────────────────────────────────────────────
+// Runs purely on the in-memory batch — no extra DB round-trip.
+// Per-trace thresholds only; session-average comparisons happen in the
+// dashboard anomaly feed which has access to historical data.
+
+export function detectAnomalies(traces: TracePayload[]): AnomalyEvent[] {
+  const events: AnomalyEvent[] = [];
+
+  for (const t of traces) {
+    if (t.metadata?.anomaly === true || t.metadata?.anomaly === "true") {
+      events.push({
+        type:        "explicit",
+        severity:    "critical",
+        projectId:   t.projectId,
+        sessionId:   t.sessionId,
+        description: t.metadata.anomaly_reason
+          ? String(t.metadata.anomaly_reason)
+          : `Step ${t.stepIndex} flagged by the tracer SDK.`,
+        detectedAt:  t.timestamp,
+        meta:        { model: t.model, stepIndex: t.stepIndex, callId: t.callId },
+      });
+    }
+
+    if (t.latencyMs >= HIGH_LATENCY_MS) {
+      events.push({
+        type:        "high_latency",
+        severity:    t.latencyMs >= 20_000 ? "critical" : "warning",
+        projectId:   t.projectId,
+        sessionId:   t.sessionId,
+        description: `Step ${t.stepIndex} took ${(t.latencyMs / 1000).toFixed(2)}s on model ${t.model}.`,
+        detectedAt:  t.timestamp,
+        meta:        { latencyMs: t.latencyMs, model: t.model, callId: t.callId },
+      });
+    }
+
+    if ((t.tokensIn ?? 0) >= TOKEN_EXPLOSION_LIMIT) {
+      events.push({
+        type:        "token_explosion",
+        severity:    (t.tokensIn ?? 0) >= 100_000 ? "critical" : "warning",
+        projectId:   t.projectId,
+        sessionId:   t.sessionId,
+        description: `Step ${t.stepIndex} sent ${t.tokensIn?.toLocaleString()} input tokens — context window near limit.`,
+        detectedAt:  t.timestamp,
+        meta:        { tokensIn: t.tokensIn, model: t.model, callId: t.callId },
+      });
+    }
+
+    if (t.estimatedCostUsd >= COST_SPIKE_USD) {
+      events.push({
+        type:        "cost_spike",
+        severity:    t.estimatedCostUsd >= 0.50 ? "critical" : "warning",
+        projectId:   t.projectId,
+        sessionId:   t.sessionId,
+        description: `Single call cost $${t.estimatedCostUsd.toFixed(4)} on model ${t.model}.`,
+        detectedAt:  t.timestamp,
+        meta:        { costUsd: t.estimatedCostUsd, model: t.model, callId: t.callId },
+      });
+    }
+  }
+
+  return events;
+}
+
+// ── Payload formatters ────────────────────────────────────────────────────────
+// Each provider expects a different JSON shape. Slack uses blocks, Discord
+// uses embeds, and generic just forwards the raw event object.
+
+const SEVERITY_EMOJI: Record<string, string> = {
+  critical: "🔴",
+  warning:  "🟡",
+};
+
+function formatSlackPayload(event: AnomalyEvent): Record<string, unknown> {
+  const emoji = SEVERITY_EMOJI[event.severity] ?? "⚠️";
+  return {
+    text: `${emoji} *0xtrace · ${event.type.replace(/_/g, " ")}*`,
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: [
+            `${emoji} *0xtrace Alert: ${event.type.replace(/_/g, " ")}*`,
+            `*Severity:* ${event.severity}`,
+            `*Session:* \`${event.sessionId}\``,
+            `*Detail:* ${event.description}`,
+          ].join("\n"),
+        },
+      },
+    ],
+  };
+}
+
+function formatDiscordPayload(event: AnomalyEvent): Record<string, unknown> {
+  const color = event.severity === "critical" ? 0xff4444 : 0xf5a623;
+  return {
+    embeds: [
+      {
+        title:       `0xtrace · ${event.type.replace(/_/g, " ")}`,
+        description: event.description,
+        color,
+        fields: [
+          { name: "Severity", value: event.severity, inline: true },
+          { name: "Session",  value: event.sessionId, inline: true },
+        ],
+        timestamp: event.detectedAt,
+      },
+    ],
+  };
+}
+
+function buildPayload(
+  provider: WebhookProvider,
+  event:    AnomalyEvent,
+): Record<string, unknown> {
+  if (provider === "slack")   return formatSlackPayload(event);
+  if (provider === "discord") return formatDiscordPayload(event);
+  return {
+    type:        event.type,
+    severity:    event.severity,
+    projectId:   event.projectId,
+    sessionId:   event.sessionId,
+    description: event.description,
+    detectedAt:  event.detectedAt,
+    meta:        event.meta,
+  };
+}
+
+// ── Delivery ──────────────────────────────────────────────────────────────────
+// Logs every attempt to webhook_deliveries regardless of outcome.
+// This gives developers a full audit trail when their endpoint rejects alerts.
+
+async function deliverWebhook(
+  webhook: WebhookConfig,
+  event:   AnomalyEvent,
+): Promise<void> {
+  const payload = buildPayload(webhook.provider, event);
+
+  let responseCode: number | null = null;
+  let responseBody: string | null = null;
+  let status: "delivered" | "failed"  = "failed";
+  let deliveredAt: string | null      = null;
+
+  try {
+    const res = await fetch(webhook.url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(payload),
+      signal:  AbortSignal.timeout(8_000),
+    });
+
+    responseCode = res.status;
+    responseBody = (await res.text()).slice(0, 500);
+
+    if (res.ok) {
+      status      = "delivered";
+      deliveredAt = new Date().toISOString();
+    }
+  } catch (err) {
+    responseBody = String(err).slice(0, 500);
+  }
+
+  await supabaseAdmin.from("webhook_deliveries").insert({
+    webhook_id:    webhook.id,
+    trigger_type:  event.type,
+    payload,
+    status,
+    response_code: responseCode,
+    response_body: responseBody,
+    delivered_at:  deliveredAt,
+  });
+}
+
+// ── Public dispatcher ─────────────────────────────────────────────────────────
+// Called by the drain worker after every batch insert.
+// Groups by project to minimise webhook_configs queries.
+
+export async function dispatchAnomalyWebhooks(
+  traces: TracePayload[],
+): Promise<void> {
+  const projectIds = [...new Set(traces.map((t) => t.projectId))];
+
+  for (const projectId of projectIds) {
+    const { data: webhooks } = await supabaseAdmin
+      .from("webhook_configs")
+      .select("*")
+      .eq("project_id", projectId)
+      .eq("is_active",  true);
+
+    if (!webhooks || webhooks.length === 0) continue;
+
+    const projectTraces = traces.filter((t) => t.projectId === projectId);
+    const anomalies     = detectAnomalies(projectTraces);
+
+    for (const anomaly of anomalies) {
+      const matching = (webhooks as WebhookConfig[]).filter((w) =>
+        w.triggers.includes(anomaly.type)
+      );
+
+      await Promise.allSettled(matching.map((w) => deliverWebhook(w, anomaly)));
+    }
+  }
+}
+</file>
+
+<file path="scripts/test-ratelimit.ts">
+// scripts/test-ratelimit.ts
+// Verifies the sliding window rate limiter on /api/ingest.
+//
+// Usage:
+//   npx tsx scripts/test-ratelimit.ts
+//
+// Expected output:
+//   Requests 1–100  → 200 OK  (queued: 1)
+//   Request  101    → 429 Too Many Requests
+//   Request  102+   → 429 Too Many Requests
+//
+// The script fires requests sequentially (not concurrently) so the
+// window counter increments predictably. Concurrent bursts would also
+// 429 correctly but make the pass/fail boundary harder to assert.
+
+import { config } from "dotenv";
+config({ path: ".env.local" });
+
+const INGEST_URL  = process.env.NEXT_PUBLIC_APP_URL
+  ? `${process.env.NEXT_PUBLIC_APP_URL}/api/ingest`
+  : "http://localhost:3000/api/ingest";
+
+const API_KEY     = process.env.TEST_INGEST_API_KEY ?? process.env.INGEST_API_KEY ?? "";
+const TOTAL_REQS  = 105;
+
+if (!API_KEY) {
+  console.error("❌  Set TEST_INGEST_API_KEY or INGEST_API_KEY in .env.local");
+  process.exit(1);
+}
+
+function makeTrace(i: number) {
+  return {
+    traces: [
+      {
+        callId:           `ratelimit-test-${i}-${Date.now()}`,
+        sessionId:        "ratelimit-smoke-test",
+        stepIndex:        i,
+        timestamp:        new Date().toISOString(),
+        model:            "gpt-4o-mini",
+        prompt:           [{ role: "user", content: `ping ${i}` }],
+        response:         "pong",
+        tokensIn:         10,
+        tokensOut:        2,
+        latencyMs:        50,
+        isStream:         false,
+        estimatedCostUsd: 0.000001,
+        sdkVersion:       "test",
+      },
+    ],
+  };
+}
+
+async function run() {
+  let passed = 0;
+  let firstRejected: number | null = null;
+
+  for (let i = 1; i <= TOTAL_REQS; i++) {
+    const res = await fetch(INGEST_URL, {
+      method:  "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key":    API_KEY,
+      },
+      body: JSON.stringify(makeTrace(i)),
+    });
+
+    const json = await res.json() as Record<string, unknown>;
+
+    if (res.status === 200) {
+      passed++;
+      if (i <= 5 || i % 20 === 0) {
+        console.log(`  ✓  [${i}]  200 OK  — remaining: ${json.remaining}`);
+      }
+    } else if (res.status === 429) {
+      if (firstRejected === null) firstRejected = i;
+      console.log(
+        `  ✗  [${i}]  429 Rate Limited  — resetAt: ${json.resetAt}`
+      );
+      if (i > (firstRejected ?? 0) + 2) {
+        console.log("  … (further 429s omitted)");
+        break;
+      }
+    } else {
+      console.error(`  ?  [${i}]  Unexpected ${res.status}:`, json);
+    }
+  }
+
+  console.log("\n── Results ──────────────────────────────────────────");
+  console.log(`  Passed:          ${passed} / 100 expected`);
+  console.log(`  First rejected:  request #${firstRejected} (expected 101)`);
+
+  const ok = passed === 100 && firstRejected === 101;
+  if (ok) {
+    console.log("\n  ✅  Rate limiter working correctly.\n");
+  } else {
+    console.error(
+      `\n  ❌  Unexpected behaviour. Check UPSTASH_REDIS_REST_URL and that` +
+      `\n      the @upstash/ratelimit package is installed.\n`
+    );
+    process.exit(1);
+  }
+}
+
+run().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
+</file>
 
 <file path=".repomixignore">
 node_modules
@@ -1757,172 +3548,6 @@ export function OnboardingForm() {
 }
 </file>
 
-<file path="app/onboarding/page.tsx">
-// app/onboarding/page.tsx
-//
-// Onboarding — two modes:
-//
-//   1. First-time user (/onboarding)
-//      No projects exist → show "Welcome" flow
-//
-//   2. Adding a new project (/onboarding?new=true)
-//      User already has projects → bypass the redirect guard
-//      Header copy changes to "New project" instead of "Welcome"
-
-import type { Metadata } from "next";
-import { redirect } from "next/navigation";
-import Link from "next/link";
-import { createClient } from "@/lib/supabase-server";
-import { OnboardingForm } from "./OnboardingForm";
-
-export const metadata: Metadata = { title: "Set up your workspace · 0xtrace" };
-
-interface PageProps {
-  searchParams: Promise<{ new?: string }>;
-}
-
-export default async function OnboardingPage({ searchParams }: PageProps) {
-  const supabase = await createClient();
-
-  // ── Auth guard ─────────────────────────────────────────────────────────────
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) redirect("/login");
-
-  // ── Determine mode ─────────────────────────────────────────────────────────
-  const sp = await searchParams;
-  const isAddingNew = sp.new === "true";
-
-  // ── Project guard ──────────────────────────────────────────────────────────
-  // Only redirect if user is NOT explicitly adding a new project.
-  if (!isAddingNew) {
-    const { data: existing } = await supabase
-      .from("projects")
-      .select("id")
-      .limit(1);
-
-    if (existing && existing.length > 0) {
-      redirect("/dashboard");
-    }
-  }
-
-  // ── Display name ───────────────────────────────────────────────────────────
-  const displayName: string =
-    (user.user_metadata?.full_name as string | undefined) ??
-    (user.user_metadata?.preferred_username as string | undefined) ??
-    user.email ??
-    "there";
-
-  const firstName = displayName.split(" ")[0];
-
-  // ── Copy varies by mode ────────────────────────────────────────────────────
-  const heading = isAddingNew ? "New project" : `Welcome, ${firstName} 👋`;
-
-  const subheading = isAddingNew
-    ? "Create a new project and generate an API key."
-    : "Create your first project to start ingesting traces. This takes about 30 seconds.";
-
-  return (
-    <div className="min-h-screen bg-[#080808] flex items-center justify-center px-4">
-      {/* Background grid */}
-      <div className="fixed inset-0 z-0 pointer-events-none">
-        <div className="absolute inset-0 opacity-[0.02] bg-[linear-gradient(#fff_1px,transparent_1px),linear-gradient(90deg,#fff_1px,transparent_1px)] bg-[length:48px_48px]" />
-        <div className="absolute top-0 left-0 right-0 h-[600px] bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-[#3b82f6]/10 via-transparent to-transparent" />
-      </div>
-
-      <div className="relative z-10 w-full max-w-[480px]">
-        {/* Logo */}
-        <div className="mb-10 text-center">
-          <span className="font-mono text-[15px] font-semibold text-white">
-            0x
-          </span>
-          <span className="font-mono text-[15px] font-normal text-[#a1a1aa]">
-            trace
-          </span>
-        </div>
-
-        {/* Card */}
-        <div className="bg-[#111] border border-[#1f1f1f] rounded-xl p-8">
-          {/* Header */}
-          <div className="mb-8">
-            {/* Back link — only shown when adding a new project */}
-            {isAddingNew && (
-              <Link
-                href="/dashboard"
-                className="inline-flex items-center gap-1.5 text-[#52525b] text-[12px] hover:text-[#a1a1aa] transition-colors no-underline mb-4"
-              >
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="m15 18-6-6 6-6" />
-                </svg>
-                Back to dashboard
-              </Link>
-            )}
-            <h1 className="m-0 text-white text-[22px] font-semibold tracking-[-0.02em]">
-              {heading}
-            </h1>
-            <p className="mt-2 mb-0 text-[#71717a] text-[14px] leading-relaxed">
-              {subheading}
-            </p>
-          </div>
-
-          {/* Steps indicator */}
-          <div className="flex items-center gap-3 mb-8">
-            {[
-              { label: "Name project", n: "1" },
-              { label: "Copy API key", n: "2" },
-              { label: "Start tracing", n: "3" },
-            ].map(({ label, n }, i) => (
-              <div key={n} className="flex items-center gap-2 flex-1">
-                <div
-                  className={[
-                    "w-6 h-6 rounded-full flex items-center justify-center",
-                    "text-[11px] font-mono font-medium flex-none",
-                    i === 0
-                      ? "bg-[#3b82f6] text-white"
-                      : "bg-[#1a1a1a] border border-[#262626] text-[#52525b]",
-                  ].join(" ")}
-                >
-                  {n}
-                </div>
-                <span
-                  className={[
-                    "text-[12px] truncate",
-                    i === 0 ? "text-[#a1a1aa]" : "text-[#3f3f46]",
-                  ].join(" ")}
-                >
-                  {label}
-                </span>
-                {i < 2 && <div className="flex-1 h-px bg-[#1f1f1f] ml-1" />}
-              </div>
-            ))}
-          </div>
-
-          {/* Form */}
-          <OnboardingForm />
-        </div>
-
-        {/* Footer note */}
-        <p className="mt-6 text-center font-mono text-[11px] text-[#3f3f46]">
-          {isAddingNew
-            ? "Each project has its own isolated traces and API keys."
-            : "You can create more projects and rotate keys from Settings."}
-        </p>
-      </div>
-    </div>
-  );
-}
-</file>
-
 <file path="CLAUDE.md">
 @AGENTS.md
 </file>
@@ -2120,559 +3745,6 @@ const res = await client.chat.completions.create({ ... });`;
 }
 </file>
 
-<file path="components/dashboard/ExplorerTable.tsx">
-// components/dashboard/ExplorerTable.tsx
-//
-// "use client" — owns sort, filter, search, and pagination state.
-//
-// Design constraints:
-//   - Zero inline styles. All conditional styling via Tailwind classes.
-//   - useRef for the debounce timer to avoid re-renders on every keystroke.
-//   - isLast computed in JS for reliable last-row border elimination
-//     (CSS :last-child is unreliable with border-collapse in Safari).
-
-"use client";
-
-import { useState, useMemo, useRef, useCallback, useTransition } from "react";
-import { useRouter, usePathname } from "next/navigation";
-import Link from "next/link";
-import type { CallRow } from "@/app/dashboard/explorer/page";
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-type SortKey = keyof Pick<
-  CallRow,
-  | "model"
-  | "tokens_in"
-  | "tokens_out"
-  | "total_tokens"
-  | "latency_ms"
-  | "estimated_cost_usd"
-  | "timestamp"
->;
-
-type SortDir = "asc" | "desc";
-
-export interface ExplorerTableProps {
-  calls: CallRow[];
-  models: string[];
-  initialModel?: string;
-  initialStatus?: string;
-  initialQuery?: string;
-}
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-const PAGE_SIZE = 20;
-const DEBOUNCE_MS = 200;
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function relativeTime(iso: string): string {
-  const diffMs = Date.now() - new Date(iso).getTime();
-  const diffMin = Math.floor(diffMs / 60_000);
-  if (diffMin < 1) return "just now";
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h ago`;
-  return `${Math.floor(diffHr / 24)}d ago`;
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return n.toString();
-}
-
-function formatCost(usd: number): string {
-  if (usd === 0) return "$0.00";
-  if (usd < 0.0001) return `$${usd.toFixed(6)}`;
-  if (usd < 0.01) return `$${usd.toFixed(4)}`;
-  return `$${usd.toFixed(4)}`;
-}
-
-function truncateId(id: string, len = 14): string {
-  return id.length > len ? `${id.slice(0, len - 1)}…` : id;
-}
-
-// ── LatencyPill ───────────────────────────────────────────────────────────────
-// Color-coded latency indicator — no inline styles, pure Tailwind variants.
-
-function LatencyPill({ ms }: { ms: number }) {
-  const label =
-    ms >= 5000
-      ? `${(ms / 1000).toFixed(1)}s`
-      : ms >= 1000
-        ? `${(ms / 1000).toFixed(2)}s`
-        : `${ms}ms`;
-
-  const colorClass =
-    ms >= 5000
-      ? "text-[#f43f5e]"
-      : ms >= 2000
-        ? "text-[#f59e0b]"
-        : "text-[#a1a1aa]";
-
-  return <span className={colorClass}>{label}</span>;
-}
-
-// ── SortButton ────────────────────────────────────────────────────────────────
-
-interface SortButtonProps {
-  field: SortKey;
-  label: string;
-  sortKey: SortKey;
-  sortDir: SortDir;
-  onSort: (f: SortKey) => void;
-}
-
-function SortButton({
-  field,
-  label,
-  sortKey,
-  sortDir,
-  onSort,
-}: SortButtonProps) {
-  const isActive = sortKey === field;
-  return (
-    <button
-      type="button"
-      onClick={() => onSort(field)}
-      className={[
-        "flex items-center gap-1 bg-transparent border-none p-0 cursor-pointer",
-        "text-[11px] uppercase tracking-[0.05em] font-medium",
-        "transition-colors duration-[120ms]",
-        isActive ? "text-[#a1a1aa]" : "text-[#71717a] hover:text-[#a1a1aa]",
-      ].join(" ")}
-    >
-      {label}
-      <span className="text-[10px]" aria-hidden="true">
-        {isActive ? (sortDir === "asc" ? "↑" : "↓") : "↕"}
-      </span>
-    </button>
-  );
-}
-
-// ── StatusBadge ───────────────────────────────────────────────────────────────
-
-function StatusBadge({ hasAnomaly }: { hasAnomaly: boolean }) {
-  if (hasAnomaly) {
-    return (
-      <span className="h-5 inline-flex items-center px-2 rounded text-[11px] font-medium tracking-[0.02em] border bg-[#2d1a00] text-[#f59e0b] border-[#451a03]">
-        anomaly
-      </span>
-    );
-  }
-  return (
-    <span className="h-5 inline-flex items-center px-2 rounded text-[11px] font-medium tracking-[0.02em] border bg-[#052e16] text-[#10b981] border-[#064e3b]">
-      ok
-    </span>
-  );
-}
-
-// ── ExplorerTable ─────────────────────────────────────────────────────────────
-
-export function ExplorerTable({
-  calls,
-  models,
-  initialModel,
-  initialStatus,
-  initialQuery,
-}: ExplorerTableProps) {
-  const router = useRouter();
-  const pathname = usePathname();
-  const [, startTransition] = useTransition();
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // ── State ──────────────────────────────────────────────────────────────
-  const [query, setQuery] = useState(initialQuery ?? "");
-  const [model, setModel] = useState(initialModel ?? "");
-  const [status, setStatus] = useState(initialStatus ?? "");
-  const [sortKey, setSortKey] = useState<SortKey>("timestamp");
-  const [sortDir, setSortDir] = useState<SortDir>("desc");
-  const [page, setPage] = useState(1);
-
-  // ── URL sync ────────────────────────────────────────────────────────────
-  const syncUrl = useCallback(
-    (params: Record<string, string>) => {
-      const sp = new URLSearchParams();
-      Object.entries(params).forEach(([k, v]) => {
-        if (v) sp.set(k, v);
-      });
-      const qs = sp.toString();
-      startTransition(() => {
-        router.replace(`${pathname}${qs ? `?${qs}` : ""}`, { scroll: false });
-      });
-    },
-    [router, pathname],
-  );
-
-  // ── Handlers ────────────────────────────────────────────────────────────
-  function handleQueryChange(value: string) {
-    setQuery(value);
-    setPage(1);
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(
-      () => syncUrl({ q: value, model, status }),
-      DEBOUNCE_MS,
-    );
-  }
-
-  function handleModelChange(value: string) {
-    setModel(value);
-    setPage(1);
-    syncUrl({ q: query, model: value, status });
-  }
-
-  function handleStatusChange(value: string) {
-    setStatus(value);
-    setPage(1);
-    syncUrl({ q: query, model, status: value });
-  }
-
-  function handleSort(field: SortKey) {
-    setSortDir(
-      sortKey === field ? (sortDir === "asc" ? "desc" : "asc") : "desc",
-    );
-    setSortKey(field);
-    setPage(1);
-  }
-
-  // ── Derived data ────────────────────────────────────────────────────────
-  const filtered = useMemo(() => {
-    let result = calls;
-    if (query.trim()) {
-      const q = query.trim().toLowerCase();
-      result = result.filter(
-        (c) =>
-          c.session_id.toLowerCase().includes(q) ||
-          c.model.toLowerCase().includes(q),
-      );
-    }
-    if (model) result = result.filter((c) => c.model === model);
-    if (status === "anomaly") result = result.filter((c) => c.has_anomaly);
-    else if (status === "complete")
-      result = result.filter((c) => !c.has_anomaly);
-    return result;
-  }, [calls, query, model, status]);
-
-  const sorted = useMemo(() => {
-    return [...filtered].sort((a, b) => {
-      const av = a[sortKey];
-      const bv = b[sortKey];
-      const dir = sortDir === "asc" ? 1 : -1;
-      if (typeof av === "number" && typeof bv === "number")
-        return (av - bv) * dir;
-      return String(av).localeCompare(String(bv)) * dir;
-    });
-  }, [filtered, sortKey, sortDir]);
-
-  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
-  const currentPage = Math.min(page, totalPages);
-  const pageStart = (currentPage - 1) * PAGE_SIZE;
-  const pageEnd = Math.min(pageStart + PAGE_SIZE, sorted.length);
-  const visible = sorted.slice(pageStart, pageEnd);
-
-  // ── Aggregate strip ──────────────────────────────────────────────────────
-  const stripMetrics = useMemo(
-    () => ({
-      calls: filtered.length,
-      tokens: filtered.reduce((s, c) => s + c.total_tokens, 0),
-      cost: filtered.reduce((s, c) => s + c.estimated_cost_usd, 0),
-      anomalies: filtered.filter((c) => c.has_anomaly).length,
-    }),
-    [filtered],
-  );
-
-  // ── Render ───────────────────────────────────────────────────────────────
-  return (
-    <div>
-      {/* ── Aggregate strip ── */}
-      <div className="grid grid-cols-4 gap-4 mb-5">
-        {[
-          {
-            label: "Calls",
-            value: stripMetrics.calls.toLocaleString(),
-            color: "text-white",
-          },
-          {
-            label: "Tokens",
-            value: formatTokens(stripMetrics.tokens),
-            color: "text-white",
-          },
-          {
-            label: "Cost",
-            value: formatCost(stripMetrics.cost),
-            color: "text-[#10b981]",
-          },
-          {
-            label: "Anomalies",
-            value: stripMetrics.anomalies.toString(),
-            color: stripMetrics.anomalies > 0 ? "text-[#f59e0b]" : "text-white",
-          },
-        ].map(({ label, value, color }) => (
-          <div
-            key={label}
-            className="bg-[#111] border border-[#1f1f1f] rounded-lg p-4"
-          >
-            <div className="text-[#71717a] text-[11px] uppercase tracking-[0.05em]">
-              {label}
-            </div>
-            <div
-              className={`mt-2 text-[26px] leading-none font-semibold tracking-[-0.03em] ${color}`}
-            >
-              {value}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
-        {/* ── Toolbar ── */}
-        <div className="flex items-center gap-3 p-4 border-b border-[#1f1f1f] flex-wrap">
-          {/* Search */}
-          <input
-            type="search"
-            placeholder="Search session ID or model…"
-            value={query}
-            onChange={(e) => handleQueryChange(e.target.value)}
-            className="h-9 flex-1 min-w-0 max-w-[300px] bg-[#0a0a0a] border border-[#262626] rounded-md px-3 text-sm text-white placeholder:text-[#52525b] outline-none transition-colors duration-[120ms] focus:border-[#3b82f6]"
-          />
-
-          {/* Model filter */}
-          <div className="relative">
-            <select
-              value={model}
-              onChange={(e) => handleModelChange(e.target.value)}
-              aria-label="Filter by model"
-              className="h-9 appearance-none bg-[#0a0a0a] border border-[#262626] rounded-md pl-3 pr-8 text-sm text-[#e4e4e7] outline-none transition-colors duration-[120ms] focus:border-[#3b82f6] cursor-pointer"
-            >
-              <option value="">All Models</option>
-              {models.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-            <span
-              className="pointer-events-none absolute right-2.5 top-2.5 text-[#71717a] text-xs"
-              aria-hidden="true"
-            >
-              ⌄
-            </span>
-          </div>
-
-          {/* Status filter */}
-          <div className="relative">
-            <select
-              value={status}
-              onChange={(e) => handleStatusChange(e.target.value)}
-              aria-label="Filter by status"
-              className="h-9 appearance-none bg-[#0a0a0a] border border-[#262626] rounded-md pl-3 pr-8 text-sm text-[#e4e4e7] outline-none transition-colors duration-[120ms] focus:border-[#3b82f6] cursor-pointer"
-            >
-              <option value="">All Statuses</option>
-              <option value="complete">OK</option>
-              <option value="anomaly">Anomaly</option>
-            </select>
-            <span
-              className="pointer-events-none absolute right-2.5 top-2.5 text-[#71717a] text-xs"
-              aria-hidden="true"
-            >
-              ⌄
-            </span>
-          </div>
-
-          <span className="ml-auto text-[#52525b] text-xs whitespace-nowrap">
-            {filtered.length} call{filtered.length !== 1 ? "s" : ""}
-          </span>
-        </div>
-
-        {/* ── Table ── */}
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse table-fixed min-w-[960px]">
-            {/* Column widths: Status | Session ID | Model | Tokens In | Tokens Out | Total | Cost | Latency | Time */}
-            <colgroup>
-              <col className="w-[56px]" />
-              <col className="w-[150px]" />
-              <col className="w-[160px]" />
-              <col className="w-[90px]" />
-              <col className="w-[90px]" />
-              <col className="w-[110px]" />
-              <col className="w-[100px]" />
-              <col className="w-[100px]" />
-              <col className="w-[110px]" />
-            </colgroup>
-
-            <thead>
-              <tr>
-                {/* Status — not sortable */}
-                <th className="h-10 text-left border-b border-[#1f1f1f] px-4 text-[#71717a] text-[11px] uppercase tracking-[0.05em] font-medium" />
-
-                {/* Session ID — not sortable (string, less useful) */}
-                <th className="h-10 text-left border-b border-[#1f1f1f] px-4 text-[#71717a] text-[11px] uppercase tracking-[0.05em] font-medium whitespace-nowrap">
-                  Session
-                </th>
-
-                {(
-                  [
-                    { field: "model" as SortKey, label: "Model" },
-                    { field: "tokens_in" as SortKey, label: "Tokens in" },
-                    { field: "tokens_out" as SortKey, label: "Tokens out" },
-                    { field: "total_tokens" as SortKey, label: "Total" },
-                    { field: "estimated_cost_usd" as SortKey, label: "Cost" },
-                    { field: "latency_ms" as SortKey, label: "Latency" },
-                    { field: "timestamp" as SortKey, label: "Time" },
-                  ] satisfies { field: SortKey; label: string }[]
-                ).map(({ field, label }) => (
-                  <th
-                    key={field}
-                    className="h-10 text-left border-b border-[#1f1f1f] px-4 whitespace-nowrap"
-                  >
-                    <SortButton
-                      field={field}
-                      label={label}
-                      sortKey={sortKey}
-                      sortDir={sortDir}
-                      onSort={handleSort}
-                    />
-                  </th>
-                ))}
-              </tr>
-            </thead>
-
-            <tbody>
-              {visible.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={9}
-                    className="h-32 text-center text-[#52525b] text-sm"
-                  >
-                    {calls.length === 0
-                      ? "No calls yet — push your first trace to get started."
-                      : "No calls match the current filters."}
-                  </td>
-                </tr>
-              ) : (
-                visible.map((call, idx) => {
-                  const isLast = idx === visible.length - 1;
-                  const rowBorder = isLast ? "" : "border-b border-[#1f1f1f]";
-                  const cell = `h-12 px-4 text-[13px] ${rowBorder}`;
-
-                  return (
-                    <tr
-                      key={call.id}
-                      className="group transition-colors duration-[120ms] hover:bg-[#161616]"
-                    >
-                      {/* Status dot */}
-                      <td className={`${cell} text-center`}>
-                        <StatusBadge hasAnomaly={call.has_anomaly} />
-                      </td>
-
-                      {/* Session ID — links to session detail */}
-                      <td className={cell}>
-                        <Link
-                          href={`/dashboard/${encodeURIComponent(call.session_id)}`}
-                          className="font-mono text-[#3b82f6] hover:text-[#60a5fa] no-underline transition-colors duration-[120ms]"
-                          title={call.session_id}
-                        >
-                          {truncateId(call.session_id)}
-                        </Link>
-                      </td>
-
-                      {/* Model */}
-                      <td className={`${cell} font-mono text-[#e4e4e7]`}>
-                        {call.model}
-                      </td>
-
-                      {/* Tokens in */}
-                      <td className={`${cell} text-[#a1a1aa]`}>
-                        {formatTokens(call.tokens_in)}
-                      </td>
-
-                      {/* Tokens out */}
-                      <td className={`${cell} text-[#a1a1aa]`}>
-                        {formatTokens(call.tokens_out)}
-                      </td>
-
-                      {/* Total */}
-                      <td className={`${cell} text-[#a1a1aa]`}>
-                        {formatTokens(call.total_tokens)}
-                      </td>
-
-                      {/* Cost */}
-                      <td className={`${cell} text-[#10b981]`}>
-                        {formatCost(call.estimated_cost_usd)}
-                      </td>
-
-                      {/* Latency */}
-                      <td className={cell}>
-                        <LatencyPill ms={call.latency_ms} />
-                      </td>
-
-                      {/* Time */}
-                      <td className={`${cell} text-[#52525b]`}>
-                        {relativeTime(call.timestamp)}
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {/* ── Pagination ── */}
-        <div className="h-[52px] flex items-center justify-between px-4 border-t border-[#1f1f1f]">
-          <span className="text-[#52525b] text-xs">
-            {sorted.length === 0
-              ? "No results"
-              : `Showing ${pageStart + 1}–${pageEnd} of ${sorted.length}`}
-          </span>
-
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={currentPage <= 1}
-              aria-label="Previous page"
-              className={[
-                "w-8 h-8 flex items-center justify-center rounded-md border bg-transparent text-sm",
-                "transition-colors duration-[120ms]",
-                currentPage <= 1
-                  ? "border-[#1f1f1f] text-[#333] cursor-not-allowed"
-                  : "border-[#333] text-[#a1a1aa] hover:border-[#555] hover:text-white cursor-pointer",
-              ].join(" ")}
-            >
-              ←
-            </button>
-
-            <span className="text-[#52525b] text-xs min-w-[60px] text-center">
-              {currentPage} / {totalPages}
-            </span>
-
-            <button
-              type="button"
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              disabled={currentPage >= totalPages}
-              aria-label="Next page"
-              className={[
-                "w-8 h-8 flex items-center justify-center rounded-md border bg-transparent text-sm",
-                "transition-colors duration-[120ms]",
-                currentPage >= totalPages
-                  ? "border-[#1f1f1f] text-[#333] cursor-not-allowed"
-                  : "border-[#333] text-[#a1a1aa] hover:border-[#555] hover:text-white cursor-pointer",
-              ].join(" ")}
-            >
-              →
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-</file>
-
 <file path="components/dashboard/MetricCard.tsx">
 // components/dashboard/MetricCard.tsx
 //
@@ -2735,194 +3807,6 @@ export function MetricCard({
         >
           {trend}
         </div>
-      )}
-    </div>
-  );
-}
-</file>
-
-<file path="components/dashboard/ProjectSwitcher.tsx">
-// components/dashboard/ProjectSwitcher.tsx
-//
-// "use client" — dropdown to switch between the user's projects.
-// Calls a server action to update the active project cookie,
-// then triggers a full page reload so all server queries re-run
-// with the new project context.
-
-"use client";
-
-import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
-import type { Project } from "@/lib/project-context";
-
-// ── Server action (defined inline — kept next to its only consumer) ──────────
-// We import it from a dedicated actions file to keep the component file clean.
-import { switchActiveProject } from "@/app/dashboard/actions";
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-interface ProjectSwitcherProps {
-  projects: Project[];
-  activeProject: Project | null;
-}
-
-// ── Component ─────────────────────────────────────────────────────────────────
-
-export function ProjectSwitcher({
-  projects,
-  activeProject,
-}: ProjectSwitcherProps) {
-  const router = useRouter();
-  const [open, setOpen] = useState(false);
-  const [isPending, startTransition] = useTransition();
-
-  function handleSelect(project: Project) {
-    if (project.id === activeProject?.id) {
-      setOpen(false);
-      return;
-    }
-    setOpen(false);
-    startTransition(async () => {
-      await switchActiveProject(project.id);
-      // Hard refresh so every server component re-runs with new project context
-      router.refresh();
-    });
-  }
-
-  if (projects.length === 0) return null;
-
-  return (
-    <div className="relative px-3 mb-1">
-      {/* Trigger */}
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        disabled={isPending}
-        className={[
-          "w-full h-9 px-3 rounded-md border",
-          "flex items-center gap-2 text-left",
-          "transition-colors duration-[120ms]",
-          open
-            ? "bg-[#1a1a1a] border-[#333] text-white"
-            : "bg-transparent border-[#1f1f1f] text-[#a1a1aa] hover:bg-[#1a1a1a] hover:border-[#333] hover:text-white",
-        ].join(" ")}
-      >
-        {/* Colour dot */}
-        <span
-          className="flex-none w-2 h-2 rounded-full bg-[#3b82f6]"
-          aria-hidden="true"
-        />
-
-        {/* Project name */}
-        <span className="flex-1 min-w-0 truncate text-[13px] font-medium">
-          {isPending ? "Switching…" : (activeProject?.name ?? "Select project")}
-        </span>
-
-        {/* Chevron */}
-        <svg
-          width="12"
-          height="12"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          className={`flex-none text-[#52525b] transition-transform duration-150 ${open ? "rotate-180" : ""}`}
-          aria-hidden="true"
-        >
-          <path d="m6 9 6 6 6-6" />
-        </svg>
-      </button>
-
-      {/* Dropdown */}
-      {open && (
-        <>
-          {/* Backdrop */}
-          <div
-            className="fixed inset-0 z-10"
-            onClick={() => setOpen(false)}
-            aria-hidden="true"
-          />
-
-          <div
-            className={[
-              "absolute left-3 right-3 top-[calc(100%+4px)] z-20",
-              "bg-[#111] border border-[#262626] rounded-lg",
-              "shadow-[0_8px_32px_rgba(0,0,0,0.5)]",
-              "overflow-hidden",
-            ].join(" ")}
-          >
-            {/* Project list */}
-            <div className="py-1">
-              {projects.map((project) => {
-                const isActive = project.id === activeProject?.id;
-                return (
-                  <button
-                    key={project.id}
-                    type="button"
-                    onClick={() => handleSelect(project)}
-                    className={[
-                      "w-full h-9 px-3 text-left",
-                      "flex items-center gap-2.5 text-[13px]",
-                      "transition-colors duration-[80ms]",
-                      isActive
-                        ? "text-white bg-[#1a1a1a]"
-                        : "text-[#a1a1aa] hover:bg-[#161616] hover:text-white",
-                    ].join(" ")}
-                  >
-                    {/* Active checkmark */}
-                    <span className="flex-none w-4 flex items-center justify-center">
-                      {isActive && (
-                        <svg
-                          width="12"
-                          height="12"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="#3b82f6"
-                          strokeWidth="2.5"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <path d="M20 6 9 17l-5-5" />
-                        </svg>
-                      )}
-                    </span>
-                    <span className="flex-1 truncate">{project.name}</span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Footer: new project link */}
-            <div className="border-t border-[#1f1f1f] py-1">
-              <a
-                href="/onboarding?new=true"
-                className={[
-                  "w-full h-9 px-3",
-                  "flex items-center gap-2.5 text-[13px] text-[#52525b]",
-                  "hover:text-[#a1a1aa] hover:bg-[#161616]",
-                  "transition-colors duration-[80ms] no-underline",
-                ].join(" ")}
-              >
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  className="flex-none ml-[2px]"
-                >
-                  <path d="M12 5v14M5 12h14" />
-                </svg>
-                New project
-              </a>
-            </div>
-          </div>
-        </>
       )}
     </div>
   );
@@ -5111,44 +5995,41 @@ export default eslintConfig;
 
 <file path="lib/diff.ts">
 // lib/diff.ts
-import type { ChatMessage } from "../packages/sdk/src/core/types";
+
+import stableStringify        from "json-stable-stringify";
+import type { ChatMessage }   from "../packages/sdk/src/core/types";
 
 export interface MessageDiff {
-  added: ChatMessage[];
-  removed: ChatMessage[];
+  added:      ChatMessage[];
+  removed:    ChatMessage[];
   tokenDelta: number;
 }
 
 function estimateTokens(messages: readonly ChatMessage[]): number {
-  return Math.ceil(JSON.stringify(messages).length / 4);
+  return Math.ceil((stableStringify(messages) ?? "").length / 4);
 }
 
-/**
- * Computes the diff between two message arrays.
- * Uses role+content identity — no positional comparison.
- * The frontend replays these diffs forward from step 1 to reconstruct
- * the full context window at any step.
- */
+function messageKey(m: ChatMessage): string {
+  return stableStringify(m) ?? JSON.stringify(m);
+}
+
 export function computeMessageDiff(
   prev: ChatMessage[],
   curr: readonly ChatMessage[]
 ): MessageDiff {
-  const added = curr.filter(
-    (m) => !prev.some((p) => p.role === m.role && p.content === m.content)
-  );
-  const removed = prev.filter(
-    (m) => !curr.some((c) => c.role === m.role && c.content === m.content)
-  );
-  const tokenDelta = estimateTokens(curr) - estimateTokens(prev);
+  const prevKeys = new Set(prev.map(messageKey));
+  const currKeys = new Set(curr.map(messageKey));
 
-  return { added, removed, tokenDelta };
+  const added   = curr.filter((m) => !prevKeys.has(messageKey(m)));
+  const removed = prev.filter((m) => !currKeys.has(messageKey(m)));
+
+  return {
+    added,
+    removed,
+    tokenDelta: estimateTokens(curr) - estimateTokens(prev),
+  };
 }
 
-/**
- * Reconstructs the full message array at step N by replaying diffs
- * forward from the base snapshot (step 1).
- * Used by the frontend to render the full context at any point.
- */
 export function replayDiffs(
   baseSnapshot: ChatMessage[],
   diffs: MessageDiff[]
@@ -5156,12 +6037,11 @@ export function replayDiffs(
   let current = [...baseSnapshot];
 
   for (const diff of diffs) {
-    // Remove messages that were removed in this step
-    current = current.filter(
-      (m) => !diff.removed.some((r) => r.role === m.role && r.content === m.content)
-    );
-    // Add messages that were added in this step
-    current = [...current, ...diff.added];
+    const removedKeys = new Set(diff.removed.map(messageKey));
+    current = [
+      ...current.filter((m) => !removedKeys.has(messageKey(m))),
+      ...diff.added,
+    ];
   }
 
   return current;
@@ -5690,85 +6570,48 @@ export interface IDispatcher {
 </file>
 
 <file path="packages/sdk/src/diff.ts">
-// ─────────────────────────────────────────────────────────────────────────────
-// packages/sdk/src/utils/diff.ts
-//
-// Computes a minimal, git-style diff between two chat message arrays.
-// The ingest API uses this to decide what to store:
-//   - Step 1  → store full snapshot (no previous to diff against)
-//   - Step 2+ → store only the diff; reconstruct full array on the frontend
-//
-// Design goals:
-//   1. Deterministic — same inputs always produce same diff.
-//   2. Reversible — applyDiff(prev, computeDiff(prev, curr)) === curr
-//   3. Zero dependencies on the openai SDK — works with plain objects.
-// ─────────────────────────────────────────────────────────────────────────────
+// packages/sdk/src/diff.ts
 
 import type { ChatMessage } from "./core/types";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-/** A single entry in the diff — describes ONE message's change. */
 export type DiffOperation =
   | { op: "add";    index: number; message: ChatMessage }
-  | { op: "remove"; index: number }
-  | { op: "keep";   index: number };   // kept for position bookkeeping
+  | { op: "remove"; index: number };
 
-/** The payload stored in prompt_snapshots.diff_from_previous */
 export interface MessageDiff {
-  /** Only the add/remove operations (keeps are omitted to save bytes). */
-  operations: Array<
-    | { op: "add";    index: number; message: ChatMessage }
-    | { op: "remove"; index: number }
-  >;
-  /** Net token change: positive = context grew, negative = messages pruned. */
+  operations: DiffOperation[];
   tokenDelta: number;
-  /** How many messages were added in this step. */
-  added: number;
-  /** How many messages were removed in this step. */
-  removed: number;
+  added:      number;
+  removed:    number;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// Inline recursive key-sorter — keeps the SDK dependency-free.
+// Handles nested objects inside message content without pulling in
+// json-stable-stringify as an external package.
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value))              return value.map(sortKeys);
+  if (value !== null && typeof value === "object") {
+    return Object.keys(value as object)
+      .sort()
+      .reduce<Record<string, unknown>>((acc, k) => {
+        acc[k] = sortKeys((value as Record<string, unknown>)[k]);
+        return acc;
+      }, {});
+  }
+  return value;
+}
 
-/**
- * Stable string key for a message — used for identity comparison.
- * We hash role + content so order changes are detected correctly.
- */
 function messageKey(m: ChatMessage): string {
-  return `${m.role}::${m.content ?? ""}`;
+  return JSON.stringify(sortKeys(m));
 }
 
-/**
- * Rough token estimator — 1 token ≈ 4 characters (GPT rule of thumb).
- * The SDK does not run a full tokenizer to stay dependency-free.
- * The backend can re-calculate with tiktoken if needed.
- */
 export function estimateTokens(messages: readonly ChatMessage[]): number {
-  return messages.reduce((sum, m) => {
-    const chars = (m.content ?? "").length;
-    return sum + Math.ceil(chars / 4);
-  }, 0);
+  return messages.reduce(
+    (sum, m) => sum + Math.ceil((m.content ?? "").length / 4),
+    0
+  );
 }
 
-// ── Core diff algorithm ───────────────────────────────────────────────────────
-
-/**
- * Computes the minimal diff between `prev` and `curr` message arrays.
- *
- * Algorithm: O(n) two-pointer walk.
- *   1. Build a Set of keys in `prev` for O(1) lookup.
- *   2. Walk `curr` — any message not in `prev` is an ADD.
- *   3. Walk `prev` — any message not in `curr` is a REMOVE.
- *
- * This is sufficient for 99% of real agent patterns where the context
- * array only ever has messages appended (never reordered mid-stream).
- * For adversarial reordering, swap to Myers diff.
- *
- * @example
- * const diff = computeMessageDiff(step1Messages, step2Messages);
- * // { operations: [{ op: "add", index: 3, message: {...} }], tokenDelta: 42, added: 1, removed: 0 }
- */
 export function computeMessageDiff(
   prev: readonly ChatMessage[],
   curr: readonly ChatMessage[]
@@ -5776,52 +6619,34 @@ export function computeMessageDiff(
   const prevKeys = new Set(prev.map(messageKey));
   const currKeys = new Set(curr.map(messageKey));
 
-  const operations: MessageDiff["operations"] = [];
+  const operations: DiffOperation[] = [];
 
-  // Detect additions — messages in curr that weren't in prev
   curr.forEach((message, index) => {
     if (!prevKeys.has(messageKey(message))) {
       operations.push({ op: "add", index, message });
     }
   });
 
-  // Detect removals — messages in prev that aren't in curr
-  prev.forEach((message, index) => {
-    if (!currKeys.has(messageKey(message))) {
+  prev.forEach((_message, index) => {
+    if (!currKeys.has(messageKey(prev[index]))) {
       operations.push({ op: "remove", index });
     }
   });
 
-  const tokenDelta =
-    estimateTokens(curr) - estimateTokens(prev);
-
   return {
     operations,
-    tokenDelta,
-    added:   operations.filter((o) => o.op === "add").length,
-    removed: operations.filter((o) => o.op === "remove").length,
+    tokenDelta: estimateTokens(curr) - estimateTokens(prev),
+    added:      operations.filter((o) => o.op === "add").length,
+    removed:    operations.filter((o) => o.op === "remove").length,
   };
 }
 
-// ── Reconstruction (used by the frontend to replay diffs) ─────────────────────
-
-/**
- * Applies a stored diff forward onto a base message array.
- * The frontend calls this to reconstruct the full message array for step N:
- *
- *   const step1 = fullSnapshot;           // stored in DB for step 1
- *   const step2 = applyDiff(step1, diff); // reconstructed from diff
- *   const step3 = applyDiff(step2, diff); // and so on...
- *
- * @throws {Error} if the diff references an out-of-bounds index.
- */
 export function applyDiff(
   base: readonly ChatMessage[],
   diff: MessageDiff
 ): ChatMessage[] {
   const result = [...base];
 
-  // Process removes first (high-index first to avoid index shifting)
   const removes = diff.operations
     .filter((o): o is { op: "remove"; index: number } => o.op === "remove")
     .sort((a, b) => b.index - a.index);
@@ -5829,17 +6654,15 @@ export function applyDiff(
   for (const op of removes) {
     if (op.index >= result.length) {
       throw new Error(
-        `[PromptTracer] applyDiff: remove index ${op.index} out of bounds (len=${result.length})`
+        `[applyDiff] remove index ${op.index} out of bounds (len=${result.length})`
       );
     }
     result.splice(op.index, 1);
   }
 
-  // Process adds (low-index first to preserve insertion order)
   const adds = diff.operations
-    .filter(
-      (o): o is { op: "add"; index: number; message: ChatMessage } =>
-        o.op === "add"
+    .filter((o): o is { op: "add"; index: number; message: ChatMessage } =>
+      o.op === "add"
     )
     .sort((a, b) => a.index - b.index);
 
@@ -5850,14 +6673,6 @@ export function applyDiff(
   return result;
 }
 
-/**
- * Replays an ordered series of diffs from a base snapshot.
- * Use this when you need to reconstruct every step in a session at once.
- *
- * @example
- * const steps = replayDiffs(step1Snapshot, [diff2, diff3, diff4]);
- * // steps[0] === step1, steps[1] === step2, steps[2] === step3, steps[3] === step4
- */
 export function replayDiffs(
   baseSnapshot: readonly ChatMessage[],
   diffs: MessageDiff[]
@@ -5865,8 +6680,7 @@ export function replayDiffs(
   const results: ChatMessage[][] = [Array.from(baseSnapshot)];
 
   for (const diff of diffs) {
-    const prev = results[results.length - 1];
-    results.push(applyDiff(prev, diff));
+    results.push(applyDiff(results[results.length - 1], diff));
   }
 
   return results;
@@ -6400,24 +7214,13 @@ export type RouteParams<T = Record<string, string>> = Promise<T>;
 
 <file path="app/api/ingest/route.ts">
 // app/api/ingest/route.ts
-//
-// Ingestion endpoint for the 0xtrace SDK.
-//
-// v2 Auth change:
-//   v1: compared x-api-key header against a hardcoded INGEST_API_KEY env var.
-//   v2: hashes the incoming key with SHA-256 and looks it up in the api_keys
-//       table. The matching row gives us the project_id, which is attached to
-//       every trace before it's pushed to the Redis queue.
-//
-// This is the only place that resolves API key → project_id.
-// Everything downstream (drain-queue cron) reads project_id from the payload.
 
-import { Redis }         from "@upstash/redis";
-import { supabaseAdmin } from "@/lib/supabase";
-import { NextRequest, NextResponse } from "next/server";
+import { Redis }                      from "@upstash/redis";
+import { Ratelimit }                  from "@upstash/ratelimit";
+import { supabaseAdmin }              from "@/lib/supabase";
+import { NextRequest, NextResponse }  from "next/server";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-// Defined locally to avoid the ESM/CJS boundary with the SDK package.
 
 interface ChatMessage {
   role:    "system" | "user" | "assistant" | "tool" | "function";
@@ -6440,11 +7243,12 @@ interface TracePayload {
   estimatedCostUsd: number;
   sdkVersion:       string;
   metadata?:        Record<string, unknown>;
-  // Injected here — not present in SDK payload
   projectId?:       string;
 }
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
+// Single Redis client shared by both the rate limiter and the queue writer.
+// Module-scope so it is reused across requests within the same worker lifetime.
 
 const redis = new Redis({
   url:   process.env.UPSTASH_REDIS_REST_URL!,
@@ -6453,15 +7257,23 @@ const redis = new Redis({
 
 const QUEUE_KEY = "trace:queue";
 
+// ── Rate limiter ──────────────────────────────────────────────────────────────
+// Sliding window prevents the fixed-window burst edge case where an agent
+// could fire 200 requests across a window boundary in under 2 seconds.
+// 100 req / 60 s per API key. A healthy agent rarely exceeds 1 req/s.
+
+const ratelimit = new Ratelimit({
+  redis,
+  limiter:   Ratelimit.slidingWindow(100, "60 s"),
+  prefix:    "oxtr_ingest",
+  analytics: true,
+});
+
 // ── Key hashing ───────────────────────────────────────────────────────────────
 
-/**
- * Hashes a plaintext API key with SHA-256 using the Web Crypto API.
- * Matches the hashing logic in app/onboarding/actions.ts exactly.
- */
 async function hashApiKey(plainKey: string): Promise<string> {
-  const encoded  = new TextEncoder().encode(plainKey);
-  const hashBuf  = await crypto.subtle.digest("SHA-256", encoded);
+  const encoded = new TextEncoder().encode(plainKey);
+  const hashBuf = await crypto.subtle.digest("SHA-256", encoded);
   return Array.from(new Uint8Array(hashBuf))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
@@ -6469,11 +7281,6 @@ async function hashApiKey(plainKey: string): Promise<string> {
 
 // ── Key → project lookup ──────────────────────────────────────────────────────
 
-/**
- * Validates an API key and returns the associated project_id.
- * Returns null if the key is invalid, revoked, or not found.
- * Uses supabaseAdmin to bypass RLS — this is an unauthenticated endpoint.
- */
 async function resolveProjectId(plainKey: string): Promise<string | null> {
   const keyHash = await hashApiKey(plainKey);
 
@@ -6484,11 +7291,8 @@ async function resolveProjectId(plainKey: string): Promise<string | null> {
     .single();
 
   if (error || !data) return null;
-
-  // Reject revoked keys
   if (data.is_active === false) return null;
 
-  // Optionally update last_used_at — fire-and-forget, don't await
   supabaseAdmin
     .from("api_keys")
     .update({ last_used_at: new Date().toISOString() })
@@ -6501,7 +7305,6 @@ async function resolveProjectId(plainKey: string): Promise<string | null> {
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
-  // ── Auth: resolve API key → project_id ────────────────────────────────────
   const rawKey = req.headers.get("x-api-key");
 
   if (!rawKey) {
@@ -6511,6 +7314,31 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // ── Rate limit (checked before auth to also throttle invalid key probes) ──
+  const { success, limit, remaining, reset } = await ratelimit.limit(rawKey);
+
+  if (!success) {
+    return NextResponse.json(
+      {
+        ok:      false,
+        error:   "Rate limit exceeded. Maximum 100 requests per 60 seconds.",
+        limit,
+        remaining,
+        resetAt: new Date(reset).toISOString(),
+      },
+      {
+        status:  429,
+        headers: {
+          "X-RateLimit-Limit":     String(limit),
+          "X-RateLimit-Remaining": String(remaining),
+          "X-RateLimit-Reset":     String(reset),
+          "Retry-After":           "60",
+        },
+      }
+    );
+  }
+
+  // ── Auth: resolve API key → project_id ────────────────────────────────────
   const projectId = await resolveProjectId(rawKey);
 
   if (!projectId) {
@@ -6550,8 +7378,6 @@ export async function POST(req: NextRequest) {
   }
 
   // ── Inject project_id and push to queue ───────────────────────────────────
-  // Each trace gets the project_id from the validated API key.
-  // The drain-queue cron reads this field to scope inserts correctly.
   try {
     await Promise.all(
       body.traces.map((trace) =>
@@ -6569,7 +7395,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  return NextResponse.json({ ok: true, queued: body.traces.length });
+  return NextResponse.json({ ok: true, queued: body.traces.length, remaining });
 }
 </file>
 
@@ -7942,6 +8768,913 @@ export function KeyManager({ initialKeys }: KeyManagerProps) {
 }
 </file>
 
+<file path="app/onboarding/page.tsx">
+// app/onboarding/page.tsx
+//
+// Onboarding — two modes:
+//
+//   1. First-time user (/onboarding)
+//      No projects exist → show "Welcome" flow
+//
+//   2. Adding a new project (/onboarding?new=true)
+//      User already has projects → bypass the redirect guard
+//      Header copy changes to "New project" instead of "Welcome"
+
+import type { Metadata } from "next";
+import { redirect } from "next/navigation";
+import Link from "next/link";
+import { createClient } from "@/lib/supabase-server";
+import { OnboardingForm } from "./OnboardingForm";
+
+export const metadata: Metadata = { title: "Set up your workspace · 0xtrace" };
+
+interface PageProps {
+  searchParams: Promise<{ new?: string }>;
+}
+
+export default async function OnboardingPage({ searchParams }: PageProps) {
+  const supabase = await createClient();
+
+  // ── Auth guard ─────────────────────────────────────────────────────────────
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) redirect("/login");
+
+  // ── Determine mode ─────────────────────────────────────────────────────────
+  const sp = await searchParams;
+  const isAddingNew = sp.new === "true";
+
+  // ── Project guard ──────────────────────────────────────────────────────────
+  // Only redirect if user is NOT explicitly adding a new project.
+  if (!isAddingNew) {
+    const { data: existing } = await supabase
+      .from("projects")
+      .select("id")
+      .limit(1);
+
+    if (existing && existing.length > 0) {
+      redirect("/dashboard");
+    }
+  }
+
+  // ── Display name ───────────────────────────────────────────────────────────
+  const displayName: string =
+    (user.user_metadata?.full_name as string | undefined) ??
+    (user.user_metadata?.preferred_username as string | undefined) ??
+    user.email ??
+    "there";
+
+  const firstName = displayName.split(" ")[0];
+
+  // ── Copy varies by mode ────────────────────────────────────────────────────
+  const heading = isAddingNew ? "New project" : `Welcome, ${firstName} 👋`;
+
+  const subheading = isAddingNew
+    ? "Create a new project and generate an API key."
+    : "Create your first project to start ingesting traces. This takes about 30 seconds.";
+
+  return (
+    <div className="min-h-screen bg-[#080808] flex items-center justify-center px-4">
+      {/* Background grid */}
+      <div className="fixed inset-0 z-0 pointer-events-none">
+        <div className="absolute inset-0 opacity-[0.02] bg-[linear-gradient(#fff_1px,transparent_1px),linear-gradient(90deg,#fff_1px,transparent_1px)] bg-[length:48px_48px]" />
+        <div className="absolute top-0 left-0 right-0 h-[600px] bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-[#3b82f6]/10 via-transparent to-transparent" />
+      </div>
+
+      <div className="relative z-10 w-full max-w-[480px]">
+        {/* Logo */}
+        <div className="mb-10 text-center">
+          <span className="font-mono text-[15px] font-semibold text-white">
+            0x
+          </span>
+          <span className="font-mono text-[15px] font-normal text-[#a1a1aa]">
+            trace
+          </span>
+        </div>
+
+        {/* Card */}
+        <div className="bg-[#111] border border-[#1f1f1f] rounded-xl p-8">
+          {/* Header */}
+          <div className="mb-8">
+            {/* Back link — only shown when adding a new project */}
+            {isAddingNew && (
+              <Link
+                href="/dashboard"
+                className="inline-flex items-center gap-1.5 text-[#52525b] text-[12px] hover:text-[#a1a1aa] transition-colors no-underline mb-4"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="m15 18-6-6 6-6" />
+                </svg>
+                Back to dashboard
+              </Link>
+            )}
+            <h1 className="m-0 text-white text-[22px] font-semibold tracking-[-0.02em]">
+              {heading}
+            </h1>
+            <p className="mt-2 mb-0 text-[#71717a] text-[14px] leading-relaxed">
+              {subheading}
+            </p>
+          </div>
+
+          {/* Steps indicator */}
+          <div className="flex items-center gap-3 mb-8">
+            {[
+              { label: "Name project", n: "1" },
+              { label: "Copy API key", n: "2" },
+              { label: "Start tracing", n: "3" },
+            ].map(({ label, n }, i) => (
+              <div key={n} className="flex items-center gap-2 flex-1">
+                <div
+                  className={[
+                    "w-6 h-6 rounded-full flex items-center justify-center",
+                    "text-[11px] font-mono font-medium flex-none",
+                    i === 0
+                      ? "bg-[#3b82f6] text-white"
+                      : "bg-[#1a1a1a] border border-[#262626] text-[#52525b]",
+                  ].join(" ")}
+                >
+                  {n}
+                </div>
+                <span
+                  className={[
+                    "text-[12px] truncate",
+                    i === 0 ? "text-[#a1a1aa]" : "text-[#3f3f46]",
+                  ].join(" ")}
+                >
+                  {label}
+                </span>
+                {i < 2 && <div className="flex-1 h-px bg-[#1f1f1f] ml-1" />}
+              </div>
+            ))}
+          </div>
+
+          {/* Form */}
+          <OnboardingForm />
+        </div>
+
+        {/* Footer note */}
+        <p className="mt-6 text-center font-mono text-[11px] text-[#3f3f46]">
+          {isAddingNew
+            ? "Each project has its own isolated traces and API keys."
+            : "You can create more projects and rotate keys from Settings."}
+        </p>
+      </div>
+    </div>
+  );
+}
+</file>
+
+<file path="components/dashboard/ExplorerTable.tsx">
+// components/dashboard/ExplorerTable.tsx
+//
+// "use client" — owns sort, filter, search, and pagination state.
+//
+// Design constraints:
+//   - Zero inline styles. All conditional styling via Tailwind classes.
+//   - useRef for the debounce timer to avoid re-renders on every keystroke.
+//   - isLast computed in JS for reliable last-row border elimination
+//     (CSS :last-child is unreliable with border-collapse in Safari).
+
+"use client";
+
+import { useState, useMemo, useRef, useCallback, useTransition } from "react";
+import { useRouter, usePathname } from "next/navigation";
+import Link from "next/link";
+import type { CallRow } from "@/app/dashboard/explorer/page";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+type SortKey = keyof Pick<
+  CallRow,
+  | "model"
+  | "tokens_in"
+  | "tokens_out"
+  | "total_tokens"
+  | "latency_ms"
+  | "estimated_cost_usd"
+  | "timestamp"
+>;
+
+type SortDir = "asc" | "desc";
+
+export interface ExplorerTableProps {
+  calls: CallRow[];
+  models: string[];
+  initialModel?: string;
+  initialStatus?: string;
+  initialQuery?: string;
+}
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const PAGE_SIZE = 20;
+const DEBOUNCE_MS = 200;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function relativeTime(iso: string): string {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const diffMin = Math.floor(diffMs / 60_000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  return `${Math.floor(diffHr / 24)}d ago`;
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toString();
+}
+
+function formatCost(usd: number): string {
+  if (usd === 0) return "$0.00";
+  if (usd < 0.0001) return `$${usd.toFixed(6)}`;
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(4)}`;
+}
+
+function truncateId(id: string, len = 14): string {
+  return id.length > len ? `${id.slice(0, len - 1)}…` : id;
+}
+
+// ── LatencyPill ───────────────────────────────────────────────────────────────
+// Color-coded latency indicator — no inline styles, pure Tailwind variants.
+
+function LatencyPill({ ms }: { ms: number }) {
+  const label =
+    ms >= 5000
+      ? `${(ms / 1000).toFixed(1)}s`
+      : ms >= 1000
+        ? `${(ms / 1000).toFixed(2)}s`
+        : `${ms}ms`;
+
+  const colorClass =
+    ms >= 5000
+      ? "text-[#f43f5e]"
+      : ms >= 2000
+        ? "text-[#f59e0b]"
+        : "text-[#a1a1aa]";
+
+  return <span className={colorClass}>{label}</span>;
+}
+
+// ── SortButton ────────────────────────────────────────────────────────────────
+
+interface SortButtonProps {
+  field: SortKey;
+  label: string;
+  sortKey: SortKey;
+  sortDir: SortDir;
+  onSort: (f: SortKey) => void;
+}
+
+function SortButton({
+  field,
+  label,
+  sortKey,
+  sortDir,
+  onSort,
+}: SortButtonProps) {
+  const isActive = sortKey === field;
+  return (
+    <button
+      type="button"
+      onClick={() => onSort(field)}
+      className={[
+        "flex items-center gap-1 bg-transparent border-none p-0 cursor-pointer",
+        "text-[11px] uppercase tracking-[0.05em] font-medium",
+        "transition-colors duration-[120ms]",
+        isActive ? "text-[#a1a1aa]" : "text-[#71717a] hover:text-[#a1a1aa]",
+      ].join(" ")}
+    >
+      {label}
+      <span className="text-[10px]" aria-hidden="true">
+        {isActive ? (sortDir === "asc" ? "↑" : "↓") : "↕"}
+      </span>
+    </button>
+  );
+}
+
+// ── StatusBadge ───────────────────────────────────────────────────────────────
+
+function StatusBadge({ hasAnomaly }: { hasAnomaly: boolean }) {
+  if (hasAnomaly) {
+    return (
+      <span className="h-5 inline-flex items-center px-2 rounded text-[11px] font-medium tracking-[0.02em] border bg-[#2d1a00] text-[#f59e0b] border-[#451a03]">
+        anomaly
+      </span>
+    );
+  }
+  return (
+    <span className="h-5 inline-flex items-center px-2 rounded text-[11px] font-medium tracking-[0.02em] border bg-[#052e16] text-[#10b981] border-[#064e3b]">
+      ok
+    </span>
+  );
+}
+
+// ── ExplorerTable ─────────────────────────────────────────────────────────────
+
+export function ExplorerTable({
+  calls,
+  models,
+  initialModel,
+  initialStatus,
+  initialQuery,
+}: ExplorerTableProps) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const [, startTransition] = useTransition();
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── State ──────────────────────────────────────────────────────────────
+  const [query, setQuery] = useState(initialQuery ?? "");
+  const [model, setModel] = useState(initialModel ?? "");
+  const [status, setStatus] = useState(initialStatus ?? "");
+  const [sortKey, setSortKey] = useState<SortKey>("timestamp");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [page, setPage] = useState(1);
+
+  // ── URL sync ────────────────────────────────────────────────────────────
+  const syncUrl = useCallback(
+    (params: Record<string, string>) => {
+      const sp = new URLSearchParams();
+      Object.entries(params).forEach(([k, v]) => {
+        if (v) sp.set(k, v);
+      });
+      const qs = sp.toString();
+      startTransition(() => {
+        router.replace(`${pathname}${qs ? `?${qs}` : ""}`, { scroll: false });
+      });
+    },
+    [router, pathname],
+  );
+
+  // ── Handlers ────────────────────────────────────────────────────────────
+  function handleQueryChange(value: string) {
+    setQuery(value);
+    setPage(1);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(
+      () => syncUrl({ q: value, model, status }),
+      DEBOUNCE_MS,
+    );
+  }
+
+  function handleModelChange(value: string) {
+    setModel(value);
+    setPage(1);
+    syncUrl({ q: query, model: value, status });
+  }
+
+  function handleStatusChange(value: string) {
+    setStatus(value);
+    setPage(1);
+    syncUrl({ q: query, model, status: value });
+  }
+
+  function handleSort(field: SortKey) {
+    setSortDir(
+      sortKey === field ? (sortDir === "asc" ? "desc" : "asc") : "desc",
+    );
+    setSortKey(field);
+    setPage(1);
+  }
+
+  // ── Derived data ────────────────────────────────────────────────────────
+  const filtered = useMemo(() => {
+    let result = calls;
+    if (query.trim()) {
+      const q = query.trim().toLowerCase();
+      result = result.filter(
+        (c) =>
+          c.session_id.toLowerCase().includes(q) ||
+          c.model.toLowerCase().includes(q),
+      );
+    }
+    if (model) result = result.filter((c) => c.model === model);
+    if (status === "anomaly") result = result.filter((c) => c.has_anomaly);
+    else if (status === "complete")
+      result = result.filter((c) => !c.has_anomaly);
+    return result;
+  }, [calls, query, model, status]);
+
+  const sorted = useMemo(() => {
+    return [...filtered].sort((a, b) => {
+      const av = a[sortKey];
+      const bv = b[sortKey];
+      const dir = sortDir === "asc" ? 1 : -1;
+      if (typeof av === "number" && typeof bv === "number")
+        return (av - bv) * dir;
+      return String(av).localeCompare(String(bv)) * dir;
+    });
+  }, [filtered, sortKey, sortDir]);
+
+  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * PAGE_SIZE;
+  const pageEnd = Math.min(pageStart + PAGE_SIZE, sorted.length);
+  const visible = sorted.slice(pageStart, pageEnd);
+
+  // ── Aggregate strip ──────────────────────────────────────────────────────
+  const stripMetrics = useMemo(
+    () => ({
+      calls: filtered.length,
+      tokens: filtered.reduce((s, c) => s + c.total_tokens, 0),
+      cost: filtered.reduce((s, c) => s + c.estimated_cost_usd, 0),
+      anomalies: filtered.filter((c) => c.has_anomaly).length,
+    }),
+    [filtered],
+  );
+
+  // ── Render ───────────────────────────────────────────────────────────────
+  return (
+    <div>
+      {/* ── Aggregate strip ── */}
+      <div className="grid grid-cols-4 gap-4 mb-5">
+        {[
+          {
+            label: "Calls",
+            value: stripMetrics.calls.toLocaleString(),
+            color: "text-white",
+          },
+          {
+            label: "Tokens",
+            value: formatTokens(stripMetrics.tokens),
+            color: "text-white",
+          },
+          {
+            label: "Cost",
+            value: formatCost(stripMetrics.cost),
+            color: "text-[#10b981]",
+          },
+          {
+            label: "Anomalies",
+            value: stripMetrics.anomalies.toString(),
+            color: stripMetrics.anomalies > 0 ? "text-[#f59e0b]" : "text-white",
+          },
+        ].map(({ label, value, color }) => (
+          <div
+            key={label}
+            className="bg-[#111] border border-[#1f1f1f] rounded-lg p-4"
+          >
+            <div className="text-[#71717a] text-[11px] uppercase tracking-[0.05em]">
+              {label}
+            </div>
+            <div
+              className={`mt-2 text-[26px] leading-none font-semibold tracking-[-0.03em] ${color}`}
+            >
+              {value}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="bg-[#111] border border-[#1f1f1f] rounded-lg overflow-hidden">
+        {/* ── Toolbar ── */}
+        <div className="flex items-center gap-3 p-4 border-b border-[#1f1f1f] flex-wrap">
+          {/* Search */}
+          <input
+            type="search"
+            placeholder="Search session ID or model…"
+            value={query}
+            onChange={(e) => handleQueryChange(e.target.value)}
+            className="h-9 flex-1 min-w-0 max-w-[300px] bg-[#0a0a0a] border border-[#262626] rounded-md px-3 text-sm text-white placeholder:text-[#52525b] outline-none transition-colors duration-[120ms] focus:border-[#3b82f6]"
+          />
+
+          {/* Model filter */}
+          <div className="relative">
+            <select
+              value={model}
+              onChange={(e) => handleModelChange(e.target.value)}
+              aria-label="Filter by model"
+              className="h-9 appearance-none bg-[#0a0a0a] border border-[#262626] rounded-md pl-3 pr-8 text-sm text-[#e4e4e7] outline-none transition-colors duration-[120ms] focus:border-[#3b82f6] cursor-pointer"
+            >
+              <option value="">All Models</option>
+              {models.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+            <span
+              className="pointer-events-none absolute right-2.5 top-2.5 text-[#71717a] text-xs"
+              aria-hidden="true"
+            >
+              ⌄
+            </span>
+          </div>
+
+          {/* Status filter */}
+          <div className="relative">
+            <select
+              value={status}
+              onChange={(e) => handleStatusChange(e.target.value)}
+              aria-label="Filter by status"
+              className="h-9 appearance-none bg-[#0a0a0a] border border-[#262626] rounded-md pl-3 pr-8 text-sm text-[#e4e4e7] outline-none transition-colors duration-[120ms] focus:border-[#3b82f6] cursor-pointer"
+            >
+              <option value="">All Statuses</option>
+              <option value="complete">OK</option>
+              <option value="anomaly">Anomaly</option>
+            </select>
+            <span
+              className="pointer-events-none absolute right-2.5 top-2.5 text-[#71717a] text-xs"
+              aria-hidden="true"
+            >
+              ⌄
+            </span>
+          </div>
+
+          <span className="ml-auto text-[#52525b] text-xs whitespace-nowrap">
+            {filtered.length} call{filtered.length !== 1 ? "s" : ""}
+          </span>
+        </div>
+
+        {/* ── Table ── */}
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse table-fixed min-w-[960px]">
+            {/* Column widths: Status | Session ID | Model | Tokens In | Tokens Out | Total | Cost | Latency | Time */}
+            <colgroup>
+              <col className="w-[56px]" />
+              <col className="w-[150px]" />
+              <col className="w-[160px]" />
+              <col className="w-[90px]" />
+              <col className="w-[90px]" />
+              <col className="w-[110px]" />
+              <col className="w-[100px]" />
+              <col className="w-[100px]" />
+              <col className="w-[110px]" />
+            </colgroup>
+
+            <thead>
+              <tr>
+                {/* Status — not sortable */}
+                <th className="h-10 text-left border-b border-[#1f1f1f] px-4 text-[#71717a] text-[11px] uppercase tracking-[0.05em] font-medium" />
+
+                {/* Session ID — not sortable (string, less useful) */}
+                <th className="h-10 text-left border-b border-[#1f1f1f] px-4 text-[#71717a] text-[11px] uppercase tracking-[0.05em] font-medium whitespace-nowrap">
+                  Session
+                </th>
+
+                {(
+                  [
+                    { field: "model" as SortKey, label: "Model" },
+                    { field: "tokens_in" as SortKey, label: "Tokens in" },
+                    { field: "tokens_out" as SortKey, label: "Tokens out" },
+                    { field: "total_tokens" as SortKey, label: "Total" },
+                    { field: "estimated_cost_usd" as SortKey, label: "Cost" },
+                    { field: "latency_ms" as SortKey, label: "Latency" },
+                    { field: "timestamp" as SortKey, label: "Time" },
+                  ] satisfies { field: SortKey; label: string }[]
+                ).map(({ field, label }) => (
+                  <th
+                    key={field}
+                    className="h-10 text-left border-b border-[#1f1f1f] px-4 whitespace-nowrap"
+                  >
+                    <SortButton
+                      field={field}
+                      label={label}
+                      sortKey={sortKey}
+                      sortDir={sortDir}
+                      onSort={handleSort}
+                    />
+                  </th>
+                ))}
+              </tr>
+            </thead>
+
+            <tbody>
+              {visible.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={9}
+                    className="h-32 text-center text-[#52525b] text-sm"
+                  >
+                    {calls.length === 0
+                      ? "No calls yet — push your first trace to get started."
+                      : "No calls match the current filters."}
+                  </td>
+                </tr>
+              ) : (
+                visible.map((call, idx) => {
+                  const isLast = idx === visible.length - 1;
+                  const rowBorder = isLast ? "" : "border-b border-[#1f1f1f]";
+                  const cell = `h-12 px-4 text-[13px] ${rowBorder}`;
+
+                  return (
+                    <tr
+                      key={call.id}
+                      className="group transition-colors duration-[120ms] hover:bg-[#161616]"
+                    >
+                      {/* Status dot */}
+                      <td className={`${cell} text-center`}>
+                        <StatusBadge hasAnomaly={call.has_anomaly} />
+                      </td>
+
+                      {/* Session ID — links to session detail */}
+                      <td className={cell}>
+                        <Link
+                          href={`/dashboard/${encodeURIComponent(call.session_id)}`}
+                          className="font-mono text-[#3b82f6] hover:text-[#60a5fa] no-underline transition-colors duration-[120ms]"
+                          title={call.session_id}
+                        >
+                          {truncateId(call.session_id)}
+                        </Link>
+                      </td>
+
+                      {/* Model */}
+                      <td className={`${cell} font-mono text-[#e4e4e7]`}>
+                        {call.model}
+                      </td>
+
+                      {/* Tokens in */}
+                      <td className={`${cell} text-[#a1a1aa]`}>
+                        {formatTokens(call.tokens_in)}
+                      </td>
+
+                      {/* Tokens out */}
+                      <td className={`${cell} text-[#a1a1aa]`}>
+                        {formatTokens(call.tokens_out)}
+                      </td>
+
+                      {/* Total */}
+                      <td className={`${cell} text-[#a1a1aa]`}>
+                        {formatTokens(call.total_tokens)}
+                      </td>
+
+                      {/* Cost */}
+                      <td className={`${cell} text-[#10b981]`}>
+                        {formatCost(call.estimated_cost_usd)}
+                      </td>
+
+                      {/* Latency */}
+                      <td className={cell}>
+                        <LatencyPill ms={call.latency_ms} />
+                      </td>
+
+                      {/* Time */}
+                      <td className={`${cell} text-[#52525b]`}>
+                        {relativeTime(call.timestamp)}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* ── Pagination ── */}
+        <div className="h-[52px] flex items-center justify-between px-4 border-t border-[#1f1f1f]">
+          <span className="text-[#52525b] text-xs">
+            {sorted.length === 0
+              ? "No results"
+              : `Showing ${pageStart + 1}–${pageEnd} of ${sorted.length}`}
+          </span>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={currentPage <= 1}
+              aria-label="Previous page"
+              className={[
+                "w-8 h-8 flex items-center justify-center rounded-md border bg-transparent text-sm",
+                "transition-colors duration-[120ms]",
+                currentPage <= 1
+                  ? "border-[#1f1f1f] text-[#333] cursor-not-allowed"
+                  : "border-[#333] text-[#a1a1aa] hover:border-[#555] hover:text-white cursor-pointer",
+              ].join(" ")}
+            >
+              ←
+            </button>
+
+            <span className="text-[#52525b] text-xs min-w-[60px] text-center">
+              {currentPage} / {totalPages}
+            </span>
+
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={currentPage >= totalPages}
+              aria-label="Next page"
+              className={[
+                "w-8 h-8 flex items-center justify-center rounded-md border bg-transparent text-sm",
+                "transition-colors duration-[120ms]",
+                currentPage >= totalPages
+                  ? "border-[#1f1f1f] text-[#333] cursor-not-allowed"
+                  : "border-[#333] text-[#a1a1aa] hover:border-[#555] hover:text-white cursor-pointer",
+              ].join(" ")}
+            >
+              →
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+</file>
+
+<file path="components/dashboard/ProjectSwitcher.tsx">
+// components/dashboard/ProjectSwitcher.tsx
+//
+// "use client" — dropdown to switch between the user's projects.
+// Calls a server action to update the active project cookie,
+// then triggers a full page reload so all server queries re-run
+// with the new project context.
+
+"use client";
+
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import type { Project } from "@/lib/project-context";
+
+// ── Server action (defined inline — kept next to its only consumer) ──────────
+// We import it from a dedicated actions file to keep the component file clean.
+import { switchActiveProject } from "@/app/dashboard/actions";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+interface ProjectSwitcherProps {
+  projects: Project[];
+  activeProject: Project | null;
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+export function ProjectSwitcher({
+  projects,
+  activeProject,
+}: ProjectSwitcherProps) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [isPending, startTransition] = useTransition();
+
+  function handleSelect(project: Project) {
+    if (project.id === activeProject?.id) {
+      setOpen(false);
+      return;
+    }
+    setOpen(false);
+    startTransition(async () => {
+      await switchActiveProject(project.id);
+      // Hard refresh so every server component re-runs with new project context
+      router.refresh();
+    });
+  }
+
+  if (projects.length === 0) return null;
+
+  return (
+    <div className="relative px-3 mb-1">
+      {/* Trigger */}
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        disabled={isPending}
+        className={[
+          "w-full h-9 px-3 rounded-md border",
+          "flex items-center gap-2 text-left",
+          "transition-colors duration-[120ms]",
+          open
+            ? "bg-[#1a1a1a] border-[#333] text-white"
+            : "bg-transparent border-[#1f1f1f] text-[#a1a1aa] hover:bg-[#1a1a1a] hover:border-[#333] hover:text-white",
+        ].join(" ")}
+      >
+        {/* Colour dot */}
+        <span
+          className="flex-none w-2 h-2 rounded-full bg-[#3b82f6]"
+          aria-hidden="true"
+        />
+
+        {/* Project name */}
+        <span className="flex-1 min-w-0 truncate text-[13px] font-medium">
+          {isPending ? "Switching…" : (activeProject?.name ?? "Select project")}
+        </span>
+
+        {/* Chevron */}
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={`flex-none text-[#52525b] transition-transform duration-150 ${open ? "rotate-180" : ""}`}
+          aria-hidden="true"
+        >
+          <path d="m6 9 6 6 6-6" />
+        </svg>
+      </button>
+
+      {/* Dropdown */}
+      {open && (
+        <>
+          {/* Backdrop */}
+          <div
+            className="fixed inset-0 z-10"
+            onClick={() => setOpen(false)}
+            aria-hidden="true"
+          />
+
+          <div
+            className={[
+              "absolute left-3 right-3 top-[calc(100%+4px)] z-20",
+              "bg-[#111] border border-[#262626] rounded-lg",
+              "shadow-[0_8px_32px_rgba(0,0,0,0.5)]",
+              "overflow-hidden",
+            ].join(" ")}
+          >
+            {/* Project list */}
+            <div className="py-1">
+              {projects.map((project) => {
+                const isActive = project.id === activeProject?.id;
+                return (
+                  <button
+                    key={project.id}
+                    type="button"
+                    onClick={() => handleSelect(project)}
+                    className={[
+                      "w-full h-9 px-3 text-left",
+                      "flex items-center gap-2.5 text-[13px]",
+                      "transition-colors duration-[80ms]",
+                      isActive
+                        ? "text-white bg-[#1a1a1a]"
+                        : "text-[#a1a1aa] hover:bg-[#161616] hover:text-white",
+                    ].join(" ")}
+                  >
+                    {/* Active checkmark */}
+                    <span className="flex-none w-4 flex items-center justify-center">
+                      {isActive && (
+                        <svg
+                          width="12"
+                          height="12"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="#3b82f6"
+                          strokeWidth="2.5"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <path d="M20 6 9 17l-5-5" />
+                        </svg>
+                      )}
+                    </span>
+                    <span className="flex-1 truncate">{project.name}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Footer: new project link */}
+            <div className="border-t border-[#1f1f1f] py-1">
+              <a
+                href="/onboarding?new=true"
+                className={[
+                  "w-full h-9 px-3",
+                  "flex items-center gap-2.5 text-[13px] text-[#52525b]",
+                  "hover:text-[#a1a1aa] hover:bg-[#161616]",
+                  "transition-colors duration-[80ms] no-underline",
+                ].join(" ")}
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="flex-none ml-[2px]"
+                >
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+                New project
+              </a>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+</file>
+
 <file path="components/dashboard/SessionExplorer.tsx">
 // components/dashboard/SessionExplorer.tsx
 "use client";
@@ -8545,32 +10278,18 @@ main().catch(console.error);
 
 <file path="app/api/cron/drain-queue/route.ts">
 // app/api/cron/drain-queue/route.ts
-//
-// Drains the Redis ingest queue into Supabase in atomic batches.
-// Invoked by Vercel Cron — protected by CRON_SECRET.
-//
-// v2 change: every row now includes project_id, read from the payload.
-// The ingest endpoint injects project_id at queue time after validating
-// the API key, so drain-queue trusts it unconditionally.
-// Traces with no project_id are skipped and logged — they are orphaned
-// v1 payloads that arrived before the migration.
 
 import { Redis }              from "@upstash/redis";
 import { supabaseAdmin }      from "@/lib/supabase";
 import { computeMessageDiff } from "@/lib/diff";
 import { calcCostUsd }        from "@/lib/cost";
-
-// ── Runtime config ────────────────────────────────────────────────────────────
+import { chunkedInsert }      from "@/lib/db";
 
 export const maxDuration = 60;
 export const dynamic     = "force-dynamic";
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
 const QUEUE_KEY  = "trace:queue";
 const BATCH_SIZE = 100;
-
-// ── Redis client ──────────────────────────────────────────────────────────────
 
 const redis = new Redis({
   url:   process.env.UPSTASH_REDIS_REST_URL!,
@@ -8600,7 +10319,6 @@ export interface TracePayload {
   estimatedCostUsd: number;
   sdkVersion:       string;
   metadata?:        Record<string, unknown>;
-  // Injected by the ingest endpoint after API key validation
   projectId?:       string;
 }
 
@@ -8658,23 +10376,22 @@ function toLlmCallRow(t: TracePayload, projectId: string): LlmCallRow {
     tokens_out:         tokensOut,
     latency_ms:         t.latencyMs,
     estimated_cost_usd: calcCostUsd({
-      model:    t.model,
+      model:     t.model,
       tokensIn:  tokensIn  ?? 0,
       tokensOut: tokensOut ?? 0,
     }),
-    is_stream:          t.isStream,
-    response:           t.response  ?? null,
-    sdk_version:        t.sdkVersion ?? null,
-    metadata:           t.metadata  ?? null,
-    timestamp:          t.timestamp,
-    project_id:         projectId,
+    is_stream:   t.isStream,
+    response:    t.response   ?? null,
+    sdk_version: t.sdkVersion ?? null,
+    metadata:    t.metadata   ?? null,
+    timestamp:   t.timestamp,
+    project_id:  projectId,
   };
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 export async function GET(req: Request) {
-  // ── Auth ─────────────────────────────────────────────────────────────────
   const authHeader = req.headers.get("authorization");
   if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
     return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
@@ -8694,38 +10411,29 @@ export async function GET(req: Request) {
     .map((raw) => parseEntry(raw))
     .filter((t): t is TracePayload => t !== null);
 
-  // ── 3. Filter out orphaned v1 traces (no project_id) ─────────────────────
+  // ── 3. Filter orphaned v1 traces ──────────────────────────────────────────
   const orphaned = allTraces.filter((t) => !t.projectId);
   if (orphaned.length > 0) {
-    console.warn(
-      `[drain-queue] Skipping ${orphaned.length} orphaned trace(s) with no project_id.`
-    );
+    console.warn(`[drain-queue] Skipping ${orphaned.length} orphaned trace(s) with no project_id.`);
   }
 
-  const traces = allTraces.filter((t): t is TracePayload & { projectId: string } =>
-    typeof t.projectId === "string" && t.projectId.length > 0
+  const traces = allTraces.filter(
+    (t): t is TracePayload & { projectId: string } =>
+      typeof t.projectId === "string" && t.projectId.length > 0
   );
 
   if (traces.length === 0) {
-    return Response.json({
-      ok:        true,
-      processed: 0,
-      message:   "No valid project-scoped traces in batch.",
-    });
+    return Response.json({ ok: true, processed: 0, message: "No valid project-scoped traces." });
   }
 
-  // ── 4. Insert into llm_calls ──────────────────────────────────────────────
-  const llmCallRows: LlmCallRow[] = traces.map((t) =>
-    toLlmCallRow(t, t.projectId)
-  );
+  // ── 4. Insert llm_calls in safe chunks ────────────────────────────────────
+  const llmCallRows: LlmCallRow[] = traces.map((t) => toLlmCallRow(t, t.projectId));
 
-  const { error: llmError } = await supabaseAdmin
-    .from("llm_calls")
-    .insert(llmCallRows);
-
-  if (llmError) {
-    console.error("[drain-queue] llm_calls insert failed:", llmError.message);
-    return Response.json({ ok: false, error: llmError.message }, { status: 500 });
+  try {
+    await chunkedInsert("llm_calls", llmCallRows);
+  } catch (err) {
+    console.error("[drain-queue] llm_calls insert failed:", err);
+    return Response.json({ ok: false, error: String(err) }, { status: 500 });
   }
 
   // ── 5. Build prompt cache for within-batch diffs ──────────────────────────
@@ -8739,11 +10447,10 @@ export async function GET(req: Request) {
 
   // ── 6. Sort by session + step for correct diff ordering ───────────────────
   const sorted = [...traces].sort(
-    (a, b) =>
-      a.sessionId.localeCompare(b.sessionId) || a.stepIndex - b.stepIndex,
+    (a, b) => a.sessionId.localeCompare(b.sessionId) || a.stepIndex - b.stepIndex,
   );
 
-  // ── 7. Build snapshot rows with diff-only logic ───────────────────────────
+  // ── 7. Build snapshot rows ────────────────────────────────────────────────
   const snapshotRows: SnapshotRow[] = [];
 
   for (const trace of sorted) {
@@ -8768,9 +10475,9 @@ export async function GET(req: Request) {
       const { data } = await supabaseAdmin
         .from("prompt_snapshots")
         .select("full_snapshot")
-        .eq("session_id", trace.sessionId)
-        .eq("step_index", trace.stepIndex - 1)
-        .eq("project_id", projectId)
+        .eq("session_id",  trace.sessionId)
+        .eq("step_index",  trace.stepIndex - 1)
+        .eq("project_id",  projectId)
         .single();
 
       if (data?.full_snapshot) {
@@ -8807,15 +10514,13 @@ export async function GET(req: Request) {
     }
   }
 
-  // ── 8. Bulk insert snapshot rows ──────────────────────────────────────────
+  // ── 8. Insert prompt_snapshots in safe chunks ─────────────────────────────
   if (snapshotRows.length > 0) {
-    const { error: snapError } = await supabaseAdmin
-      .from("prompt_snapshots")
-      .insert(snapshotRows);
-
-    if (snapError) {
-      console.error("[drain-queue] prompt_snapshots insert failed:", snapError.message);
-      return Response.json({ ok: false, error: snapError.message }, { status: 500 });
+    try {
+      await chunkedInsert("prompt_snapshots", snapshotRows);
+    } catch (err) {
+      console.error("[drain-queue] prompt_snapshots insert failed:", err);
+      return Response.json({ ok: false, error: String(err) }, { status: 500 });
     }
   }
 
@@ -11025,10 +12730,13 @@ export async function getRecentActivity(
   "dependencies": {
     "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.106.0",
+    "@upstash/qstash": "^2.11.0",
+    "@upstash/ratelimit": "^2.0.8",
     "@upstash/redis": "^1.38.0",
     "dotenv": "^17.4.2",
     "framer-motion": "^12.40.0",
     "groq-sdk": "^1.2.0",
+    "json-stable-stringify": "^1.3.0",
     "lucide-react": "^1.16.0",
     "next": "16.2.6",
     "react": "19.2.4",
@@ -11037,6 +12745,7 @@ export async function getRecentActivity(
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/json-stable-stringify": "^1.1.0",
     "@types/node": "^20",
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19",
@@ -11582,78 +13291,179 @@ export default function LoginPage() {
 
 "use client";
 
-import Link                   from "next/link";
-import { usePathname }        from "next/navigation";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { clearActiveProject } from "@/app/dashboard/actions";
-import { ProjectSwitcher }    from "./ProjectSwitcher";
-import type { Project }       from "@/lib/project-context";
+import { ProjectSwitcher } from "./ProjectSwitcher";
+import type { Project } from "@/lib/project-context";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface SidebarNavProps {
-  anomalyCount:      number;
-  projects:          Project[];
-  activeProject:     Project | null;
-  collapsed:         boolean;
-  onToggleCollapse:  () => void;
+  anomalyCount: number;
+  projects: Project[];
+  activeProject: Project | null;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
 }
 
 interface NavItem {
-  label:       string;
-  href:        string;
+  label: string;
+  href: string;
   matchPrefix: string;
-  icon:        React.ReactNode;
-  badge?:      number;
+  icon: React.ReactNode;
+  badge?: number;
 }
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
 const Icons = {
   Sessions: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
     </svg>
   ),
   Explorer: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" />
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <circle cx="11" cy="11" r="8" />
+      <path d="m21 21-4.3-4.3" />
     </svg>
   ),
   Anomalies: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3Z" />
       <path d="M12 9v4M12 17h.01" />
     </svg>
   ),
   CostAnalysis: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="m3 17 6-6 4 4 8-8" /><path d="M14 7h7v7" />
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="m3 17 6-6 4 4 8-8" />
+      <path d="M14 7h7v7" />
     </svg>
   ),
   Settings: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.72l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z" />
       <circle cx="12" cy="12" r="3" />
     </svg>
   ),
+  Webhooks: (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M18 8h1a4 4 0 0 1 0 8h-1" />
+      <path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z" />
+      <line x1="6" y1="1" x2="6" y2="4" />
+      <line x1="10" y1="1" x2="10" y2="4" />
+      <line x1="14" y1="1" x2="14" y2="4" />
+    </svg>
+  ),
   Docs: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
       <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
     </svg>
   ),
   Collapse: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="m15 18-6-6 6-6" />
     </svg>
   ),
   Expand: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="m9 18 6-6-6-6" />
     </svg>
   ),
   Logout: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
       <polyline points="16 17 21 12 16 7" />
       <line x1="21" y1="12" x2="9" y2="12" />
@@ -11664,17 +13474,25 @@ const Icons = {
 // ── Tooltip wrapper ───────────────────────────────────────────────────────────
 // Only shows when sidebar is collapsed — gives icon-only mode full labels.
 
-function Tooltip({ label, children }: { label: string; children: React.ReactNode }) {
+function Tooltip({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="relative group/tooltip">
       {children}
-      <div className={[
-        "absolute left-[calc(100%+8px)] top-1/2 -translate-y-1/2 z-50",
-        "px-2 py-1 rounded-md bg-[#1f1f1f] border border-[#333]",
-        "text-[12px] text-white whitespace-nowrap pointer-events-none",
-        "opacity-0 group-hover/tooltip:opacity-100",
-        "transition-opacity duration-150",
-      ].join(" ")}>
+      <div
+        className={[
+          "absolute left-[calc(100%+8px)] top-1/2 -translate-y-1/2 z-50",
+          "px-2 py-1 rounded-md bg-[#1f1f1f] border border-[#333]",
+          "text-[12px] text-white whitespace-nowrap pointer-events-none",
+          "opacity-0 group-hover/tooltip:opacity-100",
+          "transition-opacity duration-150",
+        ].join(" ")}
+      >
         {label}
         {/* Arrow */}
         <div className="absolute right-full top-1/2 -translate-y-1/2 border-4 border-transparent border-r-[#333]" />
@@ -11708,7 +13526,9 @@ function NavLink({
           : "text-[#a1a1aa] border-transparent",
       ].join(" ")}
     >
-      <span className="flex-none" aria-hidden="true">{item.icon}</span>
+      <span className="flex-none" aria-hidden="true">
+        {item.icon}
+      </span>
       {!collapsed && (
         <>
           <span className="flex-1 min-w-0 truncate">{item.label}</span>
@@ -11769,15 +13589,47 @@ export function SidebarNav({
   const pathname = usePathname();
 
   const primaryNav: NavItem[] = [
-    { label: "Sessions",      href: "/dashboard",           matchPrefix: "/dashboard",           icon: Icons.Sessions },
-    { label: "Explorer",      href: "/dashboard/explorer",  matchPrefix: "/dashboard/explorer",  icon: Icons.Explorer },
-    { label: "Anomalies",     href: "/dashboard/anomalies", matchPrefix: "/dashboard/anomalies", icon: Icons.Anomalies, badge: anomalyCount },
-    { label: "Cost Analysis", href: "/dashboard/cost",      matchPrefix: "/dashboard/cost",      icon: Icons.CostAnalysis },
+    {
+      label: "Sessions",
+      href: "/dashboard",
+      matchPrefix: "/dashboard",
+      icon: Icons.Sessions,
+    },
+    {
+      label: "Explorer",
+      href: "/dashboard/explorer",
+      matchPrefix: "/dashboard/explorer",
+      icon: Icons.Explorer,
+    },
+    {
+      label: "Anomalies",
+      href: "/dashboard/anomalies",
+      matchPrefix: "/dashboard/anomalies",
+      icon: Icons.Anomalies,
+      badge: anomalyCount,
+    },
+    {
+      label: "Cost Analysis",
+      href: "/dashboard/cost",
+      matchPrefix: "/dashboard/cost",
+      icon: Icons.CostAnalysis,
+    },
   ];
 
   const secondaryNav: NavItem[] = [
-    { label: "Settings", href: "/dashboard/settings", matchPrefix: "/dashboard/settings", icon: Icons.Settings },
-    { label: "Docs",     href: "/docs",               matchPrefix: "/docs",               icon: Icons.Docs },
+    {
+      label: "Settings",
+      href: "/dashboard/settings",
+      matchPrefix: "/dashboard/settings",
+      icon: Icons.Settings,
+    },
+    {
+      label: "Webhooks",
+      href: "/dashboard/settings/webhooks",
+      matchPrefix: "/dashboard/settings/webhooks",
+      icon: Icons.Webhooks,
+    },
+    { label: "Docs", href: "/docs", matchPrefix: "/docs", icon: Icons.Docs },
   ];
 
   function isActive(item: NavItem): boolean {
@@ -11798,13 +13650,17 @@ export function SidebarNav({
       aria-label="Primary navigation"
     >
       {/* ── Logo + collapse toggle ── */}
-      <div className={[
-        "flex items-center mb-5",
-        collapsed ? "justify-center" : "justify-between px-3",
-      ].join(" ")}>
+      <div
+        className={[
+          "flex items-center mb-5",
+          collapsed ? "justify-center" : "justify-between px-3",
+        ].join(" ")}
+      >
         {!collapsed && (
           <div>
-            <div className="font-mono text-white text-[15px] font-medium tracking-tight">0xtrace</div>
+            <div className="font-mono text-white text-[15px] font-medium tracking-tight">
+              0xtrace
+            </div>
             <div className="text-[#52525b] text-[12px]">AI Observability</div>
           </div>
         )}
@@ -11886,14 +13742,7 @@ export function SidebarNav({
 </file>
 
 <file path="vercel.json">
-{
-  "crons": [
-    {
-      "path": "/api/cron/drain-queue",
-      "schedule": "0 0 * * *"
-    }
-  ]
-}
+{}
 </file>
 
 <file path="app/dashboard/[sessionId]/page.tsx">
@@ -12167,6 +14016,10 @@ export default async function SessionDetailPage({ params }: PageProps) {
 
 <file path="README.md">
 # 0xtrace
+
+<a href="https://codeautopsy-lyart.vercel.app/analyze?repo=Sidhant0707%2F0xtrace">
+  <img src="https://codeautopsy-lyart.vercel.app/api/badge?repo=Sidhant0707%2F0xtrace&v=1" alt="CodeAutopsy Health" />
+</a>
 
 **[→ Live Demo](https://0xtrace-mu.vercel.app/)**
 

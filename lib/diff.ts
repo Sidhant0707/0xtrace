@@ -1,42 +1,39 @@
 // lib/diff.ts
-import type { ChatMessage } from "../packages/sdk/src/core/types";
+
+import stableStringify        from "json-stable-stringify";
+import type { ChatMessage }   from "../packages/sdk/src/core/types";
 
 export interface MessageDiff {
-  added: ChatMessage[];
-  removed: ChatMessage[];
+  added:      ChatMessage[];
+  removed:    ChatMessage[];
   tokenDelta: number;
 }
 
 function estimateTokens(messages: readonly ChatMessage[]): number {
-  return Math.ceil(JSON.stringify(messages).length / 4);
+  return Math.ceil((stableStringify(messages) ?? "").length / 4);
 }
 
-/**
- * Computes the diff between two message arrays.
- * Uses role+content identity — no positional comparison.
- * The frontend replays these diffs forward from step 1 to reconstruct
- * the full context window at any step.
- */
+function messageKey(m: ChatMessage): string {
+  return stableStringify(m) ?? JSON.stringify(m);
+}
+
 export function computeMessageDiff(
   prev: ChatMessage[],
   curr: readonly ChatMessage[]
 ): MessageDiff {
-  const added = curr.filter(
-    (m) => !prev.some((p) => p.role === m.role && p.content === m.content)
-  );
-  const removed = prev.filter(
-    (m) => !curr.some((c) => c.role === m.role && c.content === m.content)
-  );
-  const tokenDelta = estimateTokens(curr) - estimateTokens(prev);
+  const prevKeys = new Set(prev.map(messageKey));
+  const currKeys = new Set(curr.map(messageKey));
 
-  return { added, removed, tokenDelta };
+  const added   = curr.filter((m) => !prevKeys.has(messageKey(m)));
+  const removed = prev.filter((m) => !currKeys.has(messageKey(m)));
+
+  return {
+    added,
+    removed,
+    tokenDelta: estimateTokens(curr) - estimateTokens(prev),
+  };
 }
 
-/**
- * Reconstructs the full message array at step N by replaying diffs
- * forward from the base snapshot (step 1).
- * Used by the frontend to render the full context at any point.
- */
 export function replayDiffs(
   baseSnapshot: ChatMessage[],
   diffs: MessageDiff[]
@@ -44,12 +41,11 @@ export function replayDiffs(
   let current = [...baseSnapshot];
 
   for (const diff of diffs) {
-    // Remove messages that were removed in this step
-    current = current.filter(
-      (m) => !diff.removed.some((r) => r.role === m.role && r.content === m.content)
-    );
-    // Add messages that were added in this step
-    current = [...current, ...diff.added];
+    const removedKeys = new Set(diff.removed.map(messageKey));
+    current = [
+      ...current.filter((m) => !removedKeys.has(messageKey(m))),
+      ...diff.added,
+    ];
   }
 
   return current;

@@ -7,78 +7,179 @@
 
 "use client";
 
-import Link                   from "next/link";
-import { usePathname }        from "next/navigation";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { clearActiveProject } from "@/app/dashboard/actions";
-import { ProjectSwitcher }    from "./ProjectSwitcher";
-import type { Project }       from "@/lib/project-context";
+import { ProjectSwitcher } from "./ProjectSwitcher";
+import type { Project } from "@/lib/project-context";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface SidebarNavProps {
-  anomalyCount:      number;
-  projects:          Project[];
-  activeProject:     Project | null;
-  collapsed:         boolean;
-  onToggleCollapse:  () => void;
+  anomalyCount: number;
+  projects: Project[];
+  activeProject: Project | null;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
 }
 
 interface NavItem {
-  label:       string;
-  href:        string;
+  label: string;
+  href: string;
   matchPrefix: string;
-  icon:        React.ReactNode;
-  badge?:      number;
+  icon: React.ReactNode;
+  badge?: number;
 }
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
 const Icons = {
   Sessions: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
     </svg>
   ),
   Explorer: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" />
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <circle cx="11" cy="11" r="8" />
+      <path d="m21 21-4.3-4.3" />
     </svg>
   ),
   Anomalies: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3Z" />
       <path d="M12 9v4M12 17h.01" />
     </svg>
   ),
   CostAnalysis: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="m3 17 6-6 4 4 8-8" /><path d="M14 7h7v7" />
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="m3 17 6-6 4 4 8-8" />
+      <path d="M14 7h7v7" />
     </svg>
   ),
   Settings: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.72l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z" />
       <circle cx="12" cy="12" r="3" />
     </svg>
   ),
+  Webhooks: (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M18 8h1a4 4 0 0 1 0 8h-1" />
+      <path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z" />
+      <line x1="6" y1="1" x2="6" y2="4" />
+      <line x1="10" y1="1" x2="10" y2="4" />
+      <line x1="14" y1="1" x2="14" y2="4" />
+    </svg>
+  ),
   Docs: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
       <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
     </svg>
   ),
   Collapse: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="m15 18-6-6 6-6" />
     </svg>
   ),
   Expand: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="m9 18 6-6-6-6" />
     </svg>
   ),
   Logout: (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
       <polyline points="16 17 21 12 16 7" />
       <line x1="21" y1="12" x2="9" y2="12" />
@@ -89,17 +190,25 @@ const Icons = {
 // ── Tooltip wrapper ───────────────────────────────────────────────────────────
 // Only shows when sidebar is collapsed — gives icon-only mode full labels.
 
-function Tooltip({ label, children }: { label: string; children: React.ReactNode }) {
+function Tooltip({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="relative group/tooltip">
       {children}
-      <div className={[
-        "absolute left-[calc(100%+8px)] top-1/2 -translate-y-1/2 z-50",
-        "px-2 py-1 rounded-md bg-[#1f1f1f] border border-[#333]",
-        "text-[12px] text-white whitespace-nowrap pointer-events-none",
-        "opacity-0 group-hover/tooltip:opacity-100",
-        "transition-opacity duration-150",
-      ].join(" ")}>
+      <div
+        className={[
+          "absolute left-[calc(100%+8px)] top-1/2 -translate-y-1/2 z-50",
+          "px-2 py-1 rounded-md bg-[#1f1f1f] border border-[#333]",
+          "text-[12px] text-white whitespace-nowrap pointer-events-none",
+          "opacity-0 group-hover/tooltip:opacity-100",
+          "transition-opacity duration-150",
+        ].join(" ")}
+      >
         {label}
         {/* Arrow */}
         <div className="absolute right-full top-1/2 -translate-y-1/2 border-4 border-transparent border-r-[#333]" />
@@ -133,7 +242,9 @@ function NavLink({
           : "text-[#a1a1aa] border-transparent",
       ].join(" ")}
     >
-      <span className="flex-none" aria-hidden="true">{item.icon}</span>
+      <span className="flex-none" aria-hidden="true">
+        {item.icon}
+      </span>
       {!collapsed && (
         <>
           <span className="flex-1 min-w-0 truncate">{item.label}</span>
@@ -194,15 +305,47 @@ export function SidebarNav({
   const pathname = usePathname();
 
   const primaryNav: NavItem[] = [
-    { label: "Sessions",      href: "/dashboard",           matchPrefix: "/dashboard",           icon: Icons.Sessions },
-    { label: "Explorer",      href: "/dashboard/explorer",  matchPrefix: "/dashboard/explorer",  icon: Icons.Explorer },
-    { label: "Anomalies",     href: "/dashboard/anomalies", matchPrefix: "/dashboard/anomalies", icon: Icons.Anomalies, badge: anomalyCount },
-    { label: "Cost Analysis", href: "/dashboard/cost",      matchPrefix: "/dashboard/cost",      icon: Icons.CostAnalysis },
+    {
+      label: "Sessions",
+      href: "/dashboard",
+      matchPrefix: "/dashboard",
+      icon: Icons.Sessions,
+    },
+    {
+      label: "Explorer",
+      href: "/dashboard/explorer",
+      matchPrefix: "/dashboard/explorer",
+      icon: Icons.Explorer,
+    },
+    {
+      label: "Anomalies",
+      href: "/dashboard/anomalies",
+      matchPrefix: "/dashboard/anomalies",
+      icon: Icons.Anomalies,
+      badge: anomalyCount,
+    },
+    {
+      label: "Cost Analysis",
+      href: "/dashboard/cost",
+      matchPrefix: "/dashboard/cost",
+      icon: Icons.CostAnalysis,
+    },
   ];
 
   const secondaryNav: NavItem[] = [
-    { label: "Settings", href: "/dashboard/settings", matchPrefix: "/dashboard/settings", icon: Icons.Settings },
-    { label: "Docs",     href: "/docs",               matchPrefix: "/docs",               icon: Icons.Docs },
+    {
+      label: "Settings",
+      href: "/dashboard/settings",
+      matchPrefix: "/dashboard/settings",
+      icon: Icons.Settings,
+    },
+    {
+      label: "Webhooks",
+      href: "/dashboard/settings/webhooks",
+      matchPrefix: "/dashboard/settings/webhooks",
+      icon: Icons.Webhooks,
+    },
+    { label: "Docs", href: "/docs", matchPrefix: "/docs", icon: Icons.Docs },
   ];
 
   function isActive(item: NavItem): boolean {
@@ -223,13 +366,17 @@ export function SidebarNav({
       aria-label="Primary navigation"
     >
       {/* ── Logo + collapse toggle ── */}
-      <div className={[
-        "flex items-center mb-5",
-        collapsed ? "justify-center" : "justify-between px-3",
-      ].join(" ")}>
+      <div
+        className={[
+          "flex items-center mb-5",
+          collapsed ? "justify-center" : "justify-between px-3",
+        ].join(" ")}
+      >
         {!collapsed && (
           <div>
-            <div className="font-mono text-white text-[15px] font-medium tracking-tight">0xtrace</div>
+            <div className="font-mono text-white text-[15px] font-medium tracking-tight">
+              0xtrace
+            </div>
             <div className="text-[#52525b] text-[12px]">AI Observability</div>
           </div>
         )}

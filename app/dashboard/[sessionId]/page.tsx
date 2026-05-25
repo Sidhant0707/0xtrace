@@ -1,14 +1,4 @@
 // app/dashboard/[sessionId]/page.tsx
-// ============================================================================
-// Session Detail Page (v2 Multi-Tenant) - FIXED
-// ============================================================================
-// CRITICAL FIX: params is a Promise in Next.js 15+ → must await before access
-//
-// This page shows:
-// - All LLM calls in a session
-// - Token usage per step
-// - Cost breakdown
-// - Link to diff viewer and replay engine
 
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
@@ -17,10 +7,8 @@ import { getActiveProjectId } from "@/lib/project-context";
 import { formatCostUsd } from "@/lib/cost";
 import Link from "next/link";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
 interface PageProps {
-  params: Promise<{ sessionId: string }>; // ← CRITICAL: params is a Promise
+  params: Promise<{ sessionId: string }>;
 }
 
 interface LlmCall {
@@ -38,8 +26,6 @@ interface LlmCall {
   metadata: Record<string, unknown> | null;
   timestamp: string;
 }
-
-// ── Data Fetching ─────────────────────────────────────────────────────────────
 
 async function getSessionData(projectId: string, sessionId: string) {
   const { data, error } = await supabaseAdmin
@@ -59,58 +45,37 @@ async function getSessionData(projectId: string, sessionId: string) {
   return data as LlmCall[];
 }
 
-// ── Metadata ──────────────────────────────────────────────────────────────────
-
 export async function generateMetadata({
   params,
 }: PageProps): Promise<Metadata> {
-  const { sessionId } = await params; // ← CRITICAL: await params
-
-  return {
-    title: `Session ${sessionId.slice(0, 8)} - 0xtrace`,
-  };
+  const { sessionId } = await params;
+  return { title: `Session ${sessionId.slice(0, 8)} - 0xtrace` };
 }
 
-// ── Page Component ────────────────────────────────────────────────────────────
-
 export default async function SessionDetailPage({ params }: PageProps) {
-  // ── CRITICAL FIX: await params BEFORE accessing properties ─────────────────
   const { sessionId } = await params;
-
-  // ── Get active project (validates ownership) ────────────────────────────────
   const projectId = await getActiveProjectId();
-
-  // ── Fetch session data ──────────────────────────────────────────────────────
   const calls = await getSessionData(projectId, sessionId);
 
-  // ── Handle not found ────────────────────────────────────────────────────────
-  if (!calls || calls.length === 0) {
-    notFound();
-  }
+  if (!calls || calls.length === 0) notFound();
 
-  // ── Aggregate metrics ───────────────────────────────────────────────────────
   const totalCost = calls.reduce(
-    (sum, call) => sum + (call.estimated_cost_usd ?? 0),
+    (sum, c) => sum + (c.estimated_cost_usd ?? 0),
     0,
   );
-
   const totalTokens = calls.reduce(
-    (sum, call) => sum + (call.tokens_in ?? 0) + (call.tokens_out ?? 0),
+    (sum, c) => sum + (c.tokens_in ?? 0) + (c.tokens_out ?? 0),
     0,
   );
-
   const avgLatency =
-    calls.reduce((sum, call) => sum + call.latency_ms, 0) / calls.length;
-
-  const firstCall = calls[0];
-  const model = firstCall.model;
+    calls.reduce((sum, c) => sum + c.latency_ms, 0) / calls.length;
+  const model = calls[0].model;
 
   return (
     <div>
-      {/* ── Header ──────────────────────────────────────────────────────── */}
-      <div className="flex items-start justify-between gap-6 mb-6">
+      <div className="flex items-start justify-between gap-6 mb-6 flex-wrap">
         <div>
-          <div className="flex items-center gap-3 mb-2">
+          <div className="flex items-center gap-3 mb-2 flex-wrap">
             <Link
               href="/dashboard"
               className="text-zinc-500 hover:text-zinc-400 transition-colors"
@@ -127,13 +92,18 @@ export default async function SessionDetailPage({ params }: PageProps) {
           </p>
         </div>
 
-        {/* Action buttons */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <Link
             href={`/dashboard/${sessionId}/diff`}
             className="px-3 py-2 bg-zinc-900 border border-zinc-800 hover:border-zinc-700 text-zinc-300 text-sm rounded-md transition-colors"
           >
             View Diff
+          </Link>
+          <Link
+            href={`/dashboard/${sessionId}/graph`}
+            className="px-3 py-2 bg-zinc-900 border border-zinc-800 hover:border-zinc-700 text-zinc-300 text-sm rounded-md transition-colors"
+          >
+            Graph
           </Link>
           <Link
             href={`/dashboard/${sessionId}/replay`}
@@ -144,15 +114,13 @@ export default async function SessionDetailPage({ params }: PageProps) {
         </div>
       </div>
 
-      {/* ── Metrics Strip ──────────────────────────────────────────────── */}
-      <div className="grid grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
           <div className="text-zinc-500 text-xs uppercase tracking-wide mb-1">
             Total Steps
           </div>
           <div className="text-white text-2xl font-medium">{calls.length}</div>
         </div>
-
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
           <div className="text-zinc-500 text-xs uppercase tracking-wide mb-1">
             Total Cost
@@ -161,7 +129,6 @@ export default async function SessionDetailPage({ params }: PageProps) {
             {formatCostUsd(totalCost)}
           </div>
         </div>
-
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
           <div className="text-zinc-500 text-xs uppercase tracking-wide mb-1">
             Total Tokens
@@ -170,7 +137,6 @@ export default async function SessionDetailPage({ params }: PageProps) {
             {totalTokens.toLocaleString()}
           </div>
         </div>
-
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
           <div className="text-zinc-500 text-xs uppercase tracking-wide mb-1">
             Avg Latency
@@ -181,8 +147,7 @@ export default async function SessionDetailPage({ params }: PageProps) {
         </div>
       </div>
 
-      {/* ── Calls Table ────────────────────────────────────────────────── */}
-      <div className="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
+      <div className="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden overflow-x-auto">
         <table className="w-full">
           <thead>
             <tr className="border-b border-zinc-800">
@@ -250,7 +215,6 @@ export default async function SessionDetailPage({ params }: PageProps) {
         </table>
       </div>
 
-      {/* ── Debug Info (dev only) ──────────────────────────────────────── */}
       {process.env.NODE_ENV === "development" && (
         <details className="mt-6">
           <summary className="text-zinc-500 text-sm cursor-pointer hover:text-zinc-400">

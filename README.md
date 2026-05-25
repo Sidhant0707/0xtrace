@@ -26,6 +26,7 @@ Standard logging doesn't help. You need to see **exactly what changed** between 
 
 ## Architecture
 
+```text
 Your AI App
 └── wrapOpenAI(client, tracer) ← proxy intercepts every call, <2ms overhead
 └── POST /api/ingest ← validates API key → injects project_id → Redis

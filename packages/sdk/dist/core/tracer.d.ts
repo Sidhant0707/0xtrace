@@ -2,6 +2,7 @@ import type { RawCapturePayload, TracerOptions, IDispatcher, PromptResolution } 
 export declare class Tracer {
     readonly sessionId: string;
     private readonly metadata;
+    private readonly tags;
     private readonly enabled;
     private readonly dispatcher;
     private readonly resolveBaseUrl;

@@ -1,6 +1,6 @@
 {
   "name": "0xtrace",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "AI observability and PromptOps infrastructure for LLM applications.",
   "author": "Sidhant Kumar <buildwithsidhant@gmail.com>",
   "license": "MIT",
@@ -42,8 +42,10 @@
     "prepublishOnly": "cp ../../README.md ."
   },
   "dependencies": {
+    "@dagrejs/dagre": "^3.0.0",
     "diff": "^9.0.0",
-    "openai": "^6.38.0"
+    "openai": "^6.38.0",
+    "reactflow": "^11.11.4"
   },
   "devDependencies": {
     "@types/node": "^25.9.0",

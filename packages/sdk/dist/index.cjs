@@ -269,13 +269,14 @@ function uuid() {
 var Tracer = class {
   constructor(opts, dispatcher) {
     this.stepCounter = 0;
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c, _d, _e, _f;
     this.sessionId = (_a = opts.sessionId) != null ? _a : uuid();
     this.metadata = (_b = opts.metadata) != null ? _b : {};
-    this.enabled = (_c = opts.enabled) != null ? _c : true;
+    this.tags = (_c = opts.tags) != null ? _c : {};
+    this.enabled = (_d = opts.enabled) != null ? _d : true;
     this.apiKey = opts.apiKey;
-    this.timeoutMs = (_d = opts.timeoutMs) != null ? _d : DEFAULT_TIMEOUT_MS2;
-    const raw = (_e = opts.samplingRate) != null ? _e : 1;
+    this.timeoutMs = (_e = opts.timeoutMs) != null ? _e : DEFAULT_TIMEOUT_MS2;
+    const raw = (_f = opts.samplingRate) != null ? _f : 1;
     this.samplingRate = Math.min(1, Math.max(0.01, raw));
     const parsed = new URL(opts.ingestUrl);
     this.resolveBaseUrl = `${parsed.protocol}//${parsed.host}`;
@@ -354,7 +355,7 @@ var Tracer = class {
       tokensIn: (_a = raw.tokensIn) != null ? _a : 0,
       tokensOut: (_b = raw.tokensOut) != null ? _b : 0
     });
-    return __spreadValues(__spreadProps(__spreadValues({
+    const payload = __spreadProps(__spreadValues({
       callId: uuid(),
       sessionId: this.sessionId,
       stepIndex: this.stepCounter,
@@ -362,7 +363,14 @@ var Tracer = class {
     }, raw), {
       estimatedCostUsd,
       sdkVersion: SDK_VERSION
-    }), Object.keys(this.metadata).length > 0 ? { metadata: this.metadata } : {});
+    });
+    if (Object.keys(this.metadata).length > 0) {
+      payload.metadata = this.metadata;
+    }
+    if (Object.keys(this.tags).length > 0) {
+      payload.tags = this.tags;
+    }
+    return payload;
   }
 };
 

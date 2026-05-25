@@ -22,12 +22,14 @@ export interface TracePayload extends RawCapturePayload {
     estimatedCostUsd: number;
     sdkVersion: string;
     metadata?: Record<string, unknown>;
+    tags?: Record<string, string>;
 }
 export interface TracerOptions {
     ingestUrl: string;
     apiKey?: string;
     sessionId?: string;
     metadata?: Record<string, string>;
+    tags?: Record<string, string>;
     timeoutMs?: number;
     onError?: (error: Error, payload: TracePayload) => void;
     enabled?: boolean;

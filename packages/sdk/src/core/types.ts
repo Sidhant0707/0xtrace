@@ -1,3 +1,5 @@
+// packages/sdk/src/core/types.ts
+
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool" | "function";
   content: string | null;
@@ -24,6 +26,7 @@ export interface TracePayload extends RawCapturePayload {
   estimatedCostUsd: number;
   sdkVersion:       string;
   metadata?:        Record<string, unknown>;
+  tags?:            Record<string, string>;
 }
 
 export interface TracerOptions {
@@ -31,6 +34,7 @@ export interface TracerOptions {
   apiKey?:      string;
   sessionId?:   string;
   metadata?:    Record<string, string>;
+  tags?:        Record<string, string>;
   timeoutMs?:   number;
   onError?:     (error: Error, payload: TracePayload) => void;
   enabled?:     boolean;

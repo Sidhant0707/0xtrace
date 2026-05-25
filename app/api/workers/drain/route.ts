@@ -43,6 +43,8 @@ interface TracePayload {
   estimatedCostUsd: number;
   sdkVersion:       string;
   metadata?:        Record<string, unknown>;
+  // Sprint 3: tags forwarded from SDK → ingest → queue → here
+  tags?:            Record<string, string>;
   projectId?:       string;
 }
 
@@ -59,6 +61,8 @@ interface LlmCallRow {
   response:           string | null;
   sdk_version:        string | null;
   metadata:           Record<string, unknown> | null;
+  // Sprint 3: stored in the jsonb column added by migration_sprint3_session_tagging.sql
+  tags:               Record<string, string> | null;
   timestamp:          string;
   project_id:         string;
 }
@@ -108,6 +112,8 @@ function toLlmCallRow(t: TracePayload, projectId: string): LlmCallRow {
     response:    t.response   ?? null,
     sdk_version: t.sdkVersion ?? null,
     metadata:    t.metadata   ?? null,
+    // Sprint 3: write tags (null when absent so Supabase doesn't reject the row)
+    tags:        t.tags && Object.keys(t.tags).length > 0 ? t.tags : null,
     timestamp:   t.timestamp,
     project_id:  projectId,
   };

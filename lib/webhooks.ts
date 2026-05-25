@@ -2,13 +2,12 @@
 
 import { supabaseAdmin } from "@/lib/supabase";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
 export type WebhookTrigger =
   | "explicit"
   | "high_latency"
   | "token_explosion"
-  | "cost_spike";
+  | "cost_spike"
+  | "prompt_reverted";
 
 export type WebhookProvider = "slack" | "discord" | "generic";
 
@@ -32,6 +31,16 @@ export interface AnomalyEvent {
   meta:        Record<string, unknown>;
 }
 
+export interface PromptRevertEvent {
+  projectId:       string;
+  promptId:        string;
+  promptName:      string;
+  fromVersion:     string;
+  toVersion:       string;
+  healthScore:     number;
+  revertedAt:      string;
+}
+
 interface TracePayload {
   callId:           string;
   sessionId:        string;
@@ -45,16 +54,9 @@ interface TracePayload {
   projectId:        string;
 }
 
-// ── Thresholds ────────────────────────────────────────────────────────────────
-
-const HIGH_LATENCY_MS      = 10_000;
+const HIGH_LATENCY_MS       = 10_000;
 const TOKEN_EXPLOSION_LIMIT = 50_000;
 const COST_SPIKE_USD        = 0.10;
-
-// ── Anomaly detection ─────────────────────────────────────────────────────────
-// Runs purely on the in-memory batch — no extra DB round-trip.
-// Per-trace thresholds only; session-average comparisons happen in the
-// dashboard anomaly feed which has access to historical data.
 
 export function detectAnomalies(traces: TracePayload[]): AnomalyEvent[] {
   const events: AnomalyEvent[] = [];
@@ -114,10 +116,6 @@ export function detectAnomalies(traces: TracePayload[]): AnomalyEvent[] {
   return events;
 }
 
-// ── Payload formatters ────────────────────────────────────────────────────────
-// Each provider expects a different JSON shape. Slack uses blocks, Discord
-// uses embeds, and generic just forwards the raw event object.
-
 const SEVERITY_EMOJI: Record<string, string> = {
   critical: "🔴",
   warning:  "🟡",
@@ -153,8 +151,8 @@ function formatDiscordPayload(event: AnomalyEvent): Record<string, unknown> {
         description: event.description,
         color,
         fields: [
-          { name: "Severity", value: event.severity, inline: true },
-          { name: "Session",  value: event.sessionId, inline: true },
+          { name: "Severity", value: event.severity,   inline: true },
+          { name: "Session",  value: event.sessionId,  inline: true },
         ],
         timestamp: event.detectedAt,
       },
@@ -179,20 +177,16 @@ function buildPayload(
   };
 }
 
-// ── Delivery ──────────────────────────────────────────────────────────────────
-// Logs every attempt to webhook_deliveries regardless of outcome.
-// This gives developers a full audit trail when their endpoint rejects alerts.
-
 async function deliverWebhook(
   webhook: WebhookConfig,
   event:   AnomalyEvent,
 ): Promise<void> {
   const payload = buildPayload(webhook.provider, event);
 
-  let responseCode: number | null = null;
-  let responseBody: string | null = null;
-  let status: "delivered" | "failed"  = "failed";
-  let deliveredAt: string | null      = null;
+  let responseCode: number | null        = null;
+  let responseBody: string | null        = null;
+  let status: "delivered" | "failed"    = "failed";
+  let deliveredAt: string | null         = null;
 
   try {
     const res = await fetch(webhook.url, {
@@ -224,10 +218,6 @@ async function deliverWebhook(
   });
 }
 
-// ── Public dispatcher ─────────────────────────────────────────────────────────
-// Called by the drain worker after every batch insert.
-// Groups by project to minimise webhook_configs queries.
-
 export async function dispatchAnomalyWebhooks(
   traces: TracePayload[],
 ): Promise<void> {
@@ -247,10 +237,124 @@ export async function dispatchAnomalyWebhooks(
 
     for (const anomaly of anomalies) {
       const matching = (webhooks as WebhookConfig[]).filter((w) =>
-        w.triggers.includes(anomaly.type)
+        w.triggers.includes(anomaly.type),
       );
-
       await Promise.allSettled(matching.map((w) => deliverWebhook(w, anomaly)));
     }
   }
+}
+
+export async function dispatchPromptRevertWebhook(
+  event: PromptRevertEvent,
+): Promise<void> {
+  const { data: webhooks } = await supabaseAdmin
+    .from("webhook_configs")
+    .select("*")
+    .eq("project_id", event.projectId)
+    .eq("is_active",  true);
+
+  if (!webhooks || webhooks.length === 0) return;
+
+  const matching = (webhooks as WebhookConfig[]).filter((w) =>
+    w.triggers.includes("prompt_reverted"),
+  );
+
+  if (matching.length === 0) return;
+
+  const now = new Date().toISOString();
+
+  await Promise.allSettled(
+    matching.map(async (webhook) => {
+      const payload = buildRevertPayload(webhook.provider, event);
+
+      let responseCode: number | null     = null;
+      let responseBody: string | null     = null;
+      let status: "delivered" | "failed" = "failed";
+      let deliveredAt: string | null      = null;
+
+      try {
+        const res = await fetch(webhook.url, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify(payload),
+          signal:  AbortSignal.timeout(8_000),
+        });
+
+        responseCode = res.status;
+        responseBody = (await res.text()).slice(0, 500);
+
+        if (res.ok) {
+          status      = "delivered";
+          deliveredAt = new Date().toISOString();
+        }
+      } catch (err) {
+        responseBody = String(err).slice(0, 500);
+      }
+
+      await supabaseAdmin.from("webhook_deliveries").insert({
+        webhook_id:    webhook.id,
+        trigger_type:  "prompt_reverted",
+        payload,
+        status,
+        response_code: responseCode,
+        response_body: responseBody,
+        delivered_at:  deliveredAt,
+        created_at:    now,
+      });
+    }),
+  );
+}
+
+function buildRevertPayload(
+  provider: WebhookProvider,
+  event:    PromptRevertEvent,
+): Record<string, unknown> {
+  if (provider === "slack") {
+    return {
+      text: `🔁 *0xtrace · Prompt Auto-Reverted*`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: [
+              `🔁 *0xtrace: Prompt Auto-Reverted*`,
+              `*Prompt:* \`${event.promptName}\``,
+              `*Rolled back:* v${event.fromVersion} → v${event.toVersion}`,
+              `*Health score at revert:* ${event.healthScore.toFixed(1)}`,
+            ].join("\n"),
+          },
+        },
+      ],
+    };
+  }
+
+  if (provider === "discord") {
+    return {
+      embeds: [
+        {
+          title:       `0xtrace · Prompt Auto-Reverted`,
+          description: `Prompt \`${event.promptName}\` was automatically rolled back due to health degradation.`,
+          color:       0xf5a623,
+          fields: [
+            { name: "From Version", value: `v${event.fromVersion}`, inline: true },
+            { name: "To Version",   value: `v${event.toVersion}`,   inline: true },
+            { name: "Health Score", value: event.healthScore.toFixed(1), inline: true },
+          ],
+          timestamp: event.revertedAt,
+        },
+      ],
+    };
+  }
+
+  return {
+    type:        "prompt_reverted",
+    projectId:   event.projectId,
+    promptId:    event.promptId,
+    promptName:  event.promptName,
+    fromVersion: event.fromVersion,
+    toVersion:   event.toVersion,
+    healthScore: event.healthScore,
+    revertedAt:  event.revertedAt,
+  };
 }

@@ -80,6 +80,19 @@ export async function deployVersion(
     .update({ is_deployed: true })
     .eq("id", versionId);
 
+  const { data: version } = await supabaseAdmin
+    .from("prompt_versions")
+    .select("version")
+    .eq("id", versionId)
+    .single();
+
+  await supabaseAdmin.from("prompt_events").insert({
+    prompt_id:  promptId,
+    event_type: "deployed",
+    version_id: versionId,
+    metadata:   { version: version?.version ?? null },
+  });
+
   revalidatePath(`/dashboard/prompts/${promptId}`);
 }
 

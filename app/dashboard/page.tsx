@@ -23,6 +23,8 @@ interface LlmCallRaw {
   latency_ms: number;
   estimated_cost_usd: number | null;
   metadata: Record<string, unknown> | null;
+  // Sprint 3: tags column added by migration_sprint3_session_tagging.sql
+  tags: Record<string, string> | null;
   timestamp: string;
 }
 
@@ -35,6 +37,8 @@ export interface SessionRow {
   avg_latency_ms: number;
   has_anomaly: boolean;
   last_call_at: string;
+  // Sprint 3: union of all call tags within the session (later calls win on key conflict)
+  tags: Record<string, string>;
 }
 
 interface DashboardMetrics {
@@ -52,18 +56,27 @@ interface PageProps {
 
 async function getSessions(
   projectId: string,
-  filters: { model?: string; status?: string; q?: string },
+  filters: { model?: string; status?: string; q?: string; tag?: string },
 ): Promise<SessionRow[]> {
   let query = supabaseAdmin
     .from("llm_calls")
     .select(
-      "session_id, model, tokens_in, tokens_out, latency_ms, estimated_cost_usd, metadata, timestamp",
+      "session_id, model, tokens_in, tokens_out, latency_ms, estimated_cost_usd, metadata, tags, timestamp",
     )
     .eq("project_id", projectId)
     .order("timestamp", { ascending: false });
 
   if (filters.model) query = query.eq("model", filters.model);
   if (filters.q) query = query.ilike("session_id", `${filters.q}%`);
+
+  // Sprint 3: server-side tag pre-filter — only rows where the tags jsonb
+  // column contains at least one key whose value matches the tag query string.
+  // Client-side secondary filter below handles partial matches across key names.
+  // Using .not("tags", "is", null) when a tag filter is present avoids scanning
+  // tagless rows; the GIN index on tags makes this fast.
+  if (filters.tag) {
+    query = query.not("tags", "is", null);
+  }
 
   const { data, error } = (await query.limit(500)) as {
     data: LlmCallRaw[] | null;
@@ -90,6 +103,8 @@ async function getSessions(
         avg_latency_ms: row.latency_ms,
         has_anomaly: isAnomaly,
         last_call_at: row.timestamp,
+        // Sprint 3: seed tags from this call (non-null guard — empty object if null)
+        tags: row.tags ?? {},
       });
     } else {
       existing.step_count += 1;
@@ -99,6 +114,8 @@ async function getSessions(
         (existing.avg_latency_ms * (existing.step_count - 1) + row.latency_ms) /
         existing.step_count;
       existing.has_anomaly = existing.has_anomaly || isAnomaly;
+      // Sprint 3: merge — later calls overwrite on key conflict (last-writer-wins)
+      if (row.tags) existing.tags = { ...existing.tags, ...row.tags };
       if (row.timestamp > existing.last_call_at)
         existing.last_call_at = row.timestamp;
     }
@@ -110,6 +127,17 @@ async function getSessions(
     sessions = sessions.filter((s) => s.has_anomaly);
   if (filters.status === "complete")
     sessions = sessions.filter((s) => !s.has_anomaly);
+
+  // Sprint 3: client-side tag filter — matches key OR value substring
+  if (filters.tag) {
+    const tq = filters.tag.trim().toLowerCase();
+    sessions = sessions.filter((s) =>
+      Object.entries(s.tags).some(
+        ([k, v]) =>
+          k.toLowerCase().includes(tq) || v.toLowerCase().includes(tq),
+      ),
+    );
+  }
 
   sessions.sort((a, b) => (a.last_call_at < b.last_call_at ? 1 : -1));
   return sessions;
@@ -167,15 +195,17 @@ export default async function SessionsPage({ searchParams }: PageProps) {
   const model = typeof params.model === "string" ? params.model : undefined;
   const status = typeof params.status === "string" ? params.status : undefined;
   const q = typeof params.q === "string" ? params.q : undefined;
+  // Sprint 3: tag filter param — e.g. ?tag=env:production or just ?tag=env
+  const tag = typeof params.tag === "string" ? params.tag : undefined;
 
   const [sessions, metrics, models] = await Promise.all([
-    getSessions(projectId, { model, status, q }),
+    getSessions(projectId, { model, status, q, tag }),
     getMetrics(projectId),
     getDistinctModels(projectId),
   ]);
 
   // ── Empty state — only when no filters applied and no data ────────────────
-  if (sessions.length === 0 && !model && !status && !q) {
+  if (sessions.length === 0 && !model && !status && !q && !tag) {
     return (
       <div>
         <div className="mb-6">
@@ -234,6 +264,7 @@ export default async function SessionsPage({ searchParams }: PageProps) {
         initialModel={model}
         initialStatus={status}
         initialQuery={q}
+        initialTag={tag}
       />
     </div>
   );

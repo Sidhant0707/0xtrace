@@ -1,3 +1,5 @@
+// packages/sdk/src/core/tracer.ts
+
 import { Dispatcher }  from "./dispatcher";
 import { calcCostUsd } from "../utils/cost";
 import type {
@@ -32,6 +34,7 @@ export class Tracer {
   readonly sessionId: string;
 
   private readonly metadata:        Record<string, string>;
+  private readonly tags:            Record<string, string>;
   private readonly enabled:         boolean;
   private readonly dispatcher:      IDispatcher;
   private readonly resolveBaseUrl:  string;
@@ -44,6 +47,7 @@ export class Tracer {
   constructor(opts: TracerOptions, dispatcher?: IDispatcher) {
     this.sessionId      = opts.sessionId ?? uuid();
     this.metadata       = opts.metadata  ?? {};
+    this.tags           = opts.tags      ?? {};
     this.enabled        = opts.enabled   ?? true;
     this.apiKey         = opts.apiKey;
     this.timeoutMs      = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -150,7 +154,7 @@ export class Tracer {
       tokensOut: raw.tokensOut ?? 0,
     });
 
-    return {
+    const payload: TracePayload = {
       callId:    uuid(),
       sessionId: this.sessionId,
       stepIndex: this.stepCounter,
@@ -160,10 +164,16 @@ export class Tracer {
 
       estimatedCostUsd,
       sdkVersion: SDK_VERSION,
+    };
 
-      ...(Object.keys(this.metadata).length > 0
-        ? { metadata: this.metadata }
-        : {}),
-    } as TracePayload;
+    if (Object.keys(this.metadata).length > 0) {
+      payload.metadata = this.metadata;
+    }
+
+    if (Object.keys(this.tags).length > 0) {
+      payload.tags = this.tags;
+    }
+
+    return payload;
   }
 }

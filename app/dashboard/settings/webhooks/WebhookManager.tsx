@@ -39,8 +39,9 @@ interface Props {
 const TRIGGER_OPTIONS: { value: WebhookTrigger; label: string }[] = [
   { value: "explicit", label: "SDK-flagged anomaly" },
   { value: "high_latency", label: "High latency (>10s)" },
-  { value: "token_explosion", label: "Token explosion" },
+  { value: "token_explosion", label: "Token explosion (>50k)" },
   { value: "cost_spike", label: "Cost spike" },
+  { value: "prompt_reverted", label: "Prompt auto-reverted" },
 ];
 
 const PROVIDER_OPTIONS: { value: WebhookProvider; label: string }[] = [

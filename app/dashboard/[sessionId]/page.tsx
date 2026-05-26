@@ -106,6 +106,12 @@ export default async function SessionDetailPage({ params }: PageProps) {
             Graph
           </Link>
           <Link
+  href={`/dashboard/${sessionId}/pressure`}
+  className="px-3 py-2 bg-zinc-900 border border-zinc-800 hover:border-zinc-700 text-zinc-300 text-sm rounded-md transition-colors"
+>
+  Pressure
+</Link>
+          <Link
             href={`/dashboard/${sessionId}/replay`}
             className="px-3 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm rounded-md transition-colors"
           >

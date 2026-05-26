@@ -226,6 +226,25 @@ export default async function PromptDetailPage({
         </pre>
       </div>
 
+      {/* ─── Tab row ─────────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-1 mb-6 overflow-x-auto">
+        {[
+          { label: "Overview", href: `/dashboard/prompts/${prompt.id}` },
+          {
+            label: "Blast Radius",
+            href: `/dashboard/prompts/${prompt.id}/blast-radius`,
+          },
+        ].map((tab) => (
+          <Link
+            key={tab.label}
+            href={tab.href}
+            className="shrink-0 px-3 py-1.5 rounded text-sm transition-colors text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900"
+          >
+            {tab.label}
+          </Link>
+        ))}
+      </div>
+
       <div className="space-y-6">
         <VersionManager
           promptId={prompt.id}

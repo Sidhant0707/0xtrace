@@ -28,7 +28,7 @@ async function getDeliveries(projectId: string) {
     .order("created_at", { ascending: false })
     .limit(50);
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-return (data ?? []).map(({ webhook_configs: _wc, ...rest }) => rest);
+  return (data ?? []).map(({ webhook_configs: _wc, ...rest }) => rest);
 }
 
 export default async function WebhooksPage() {
